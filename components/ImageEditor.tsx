@@ -1,5 +1,7 @@
+"use client";
+
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ClickPoint, EditorSettings, MaskRegion } from "../types";
+import type { ClickPoint, EditorSettings, MaskRegion } from "@/types";
 import {
   clampRegion,
   clientToImagePoint,
@@ -16,7 +18,7 @@ import {
   regionFromPoints,
   syncBrushOverlayFromMask,
   type RenderedImageBounds,
-} from "../utils/maskGeometry";
+} from "@/lib/maskGeometry";
 
 interface MaskCanvasProps {
   imageUrl: string;

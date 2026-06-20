@@ -1,26 +1,31 @@
-# Logo Remover — Click to Inpaint
+# Logo Remover — Next.js
 
-React + Express app that removes logos/watermarks from images using click-to-mask and the [LaMa inpaint API](https://sanster-iopaint-lama.hf.space).
+Remove logos and watermarks from images using click-to-select or brush painting, powered by [LaMa inpaint](https://sanster-iopaint-lama.hf.space).
+
+## Stack
+
+- **Next.js 15** (App Router)
+- **React 19** + TypeScript
+- **Tailwind CSS**
+- **Sharp** (server-side image processing)
+- **API Routes** (`/api/health`, `/api/inpaint`)
 
 ## Features
 
-- Upload image (drag & drop or click)
-- **Click on the logo** to place the removal mask
-- Adjustable mask width, height, and feather blur
-- Bottom-right auto mode (matches your batch script)
-- Before/after comparison and PNG download
-- Express proxy avoids CORS issues with the Hugging Face Space API
+- Upload image (drag & drop)
+- **Select box** — drag a rectangle around the logo
+- **Brush** — paint over the watermark
+- Before/after comparison + PNG download
+- LaMa AI inpainting via Hugging Face Space API
 
 ## Quick start
 
 ```bash
 npm install
-npm install --prefix server
-npm install --prefix client
 npm run dev
 ```
 
-Open **http://localhost:5173**
+Open **http://localhost:3000**
 
 ## Production
 
@@ -29,7 +34,26 @@ npm run build
 npm start
 ```
 
-## Stack
+## Environment
 
-- **Frontend:** React 19, Vite, Tailwind CSS, TypeScript
-- **Backend:** Express, Sharp, Multer
+| Variable | Default |
+|----------|---------|
+| `INPAINT_API_URL` | `https://sanster-iopaint-lama.hf.space/api/v1/inpaint` |
+
+## Project structure
+
+```
+app/
+  api/health/route.ts    # Health check
+  api/inpaint/route.ts   # Logo removal API
+  layout.tsx
+  page.tsx
+components/
+  LogoRemoverApp.tsx     # Main UI
+  ImageEditor.tsx        # Mask canvas + tools
+lib/
+  inpaint.ts             # Server inpaint logic
+  maskGeometry.ts        # Selection math
+types/
+  index.ts
+```

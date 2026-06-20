@@ -1,14 +1,16 @@
+"use client";
+
 import { useCallback, useEffect, useState } from "react";
-import { MaskCanvas, ToolControls } from "./components/ImageEditor";
+import { MaskCanvas, ToolControls } from "@/components/ImageEditor";
 import {
   DEFAULT_EDITOR_SETTINGS,
   type EditorSettings,
   type MaskRegion,
-} from "./types";
+} from "@/types";
 
 type Step = "upload" | "edit" | "result";
 
-export default function App() {
+export default function LogoRemoverApp() {
   const [step, setStep] = useState<Step>("upload");
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);

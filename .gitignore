@@ -1,6 +1,9 @@
 node_modules/
-server/node_modules/
+.next/
+out/
 .env
 .env.local
+.env*.local
 dist/
 build/
+*.tsbuildinfo

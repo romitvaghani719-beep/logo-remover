@@ -1,4 +1,4 @@
-import type { ClickPoint, MaskRegion } from "../types";
+import type { ClickPoint, MaskRegion } from "@/types";
 
 export interface RenderedImageBounds {
   offsetX: number;

@@ -19,11 +19,14 @@ import {
   syncBrushOverlayFromMask,
   type RenderedImageBounds,
 } from "@/lib/maskGeometry";
+import { getGeminiSearchZone } from "@/lib/geminiSearchZone";
 
 interface MaskCanvasProps {
   imageUrl: string;
   settings: EditorSettings;
   onMaskChange: (maskBlob: Blob | null, region: MaskRegion | null) => void;
+  detectedRegion?: MaskRegion | null;
+  showSearchGuides?: boolean;
   disabled?: boolean;
 }
 
@@ -31,6 +34,8 @@ export function MaskCanvas({
   imageUrl,
   settings,
   onMaskChange,
+  detectedRegion = null,
+  showSearchGuides = true,
   disabled = false,
 }: MaskCanvasProps) {
   const stageRef = useRef<HTMLDivElement>(null);
@@ -101,10 +106,59 @@ export function MaskCanvas({
 
     octx.clearRect(0, 0, w, h);
 
+    if (showSearchGuides && img.naturalWidth && img.naturalHeight) {
+      const zone = getGeminiSearchZone(img.naturalWidth, img.naturalHeight);
+      const scaleX = w / img.naturalWidth;
+      const scaleY = h / img.naturalHeight;
+
+      const midX = zone.midX * scaleX;
+      const midY = zone.midY * scaleY;
+      const q4MidX = zone.q4MidX * scaleX;
+      const q4MidY = zone.q4MidY * scaleY;
+      const search = zone.searchRegion;
+
+      octx.fillStyle = "rgba(99, 102, 241, 0.1)";
+      octx.fillRect(
+        search.x1 * scaleX,
+        search.y1 * scaleY,
+        search.width * scaleX,
+        search.height * scaleY
+      );
+
+      octx.setLineDash([8, 5]);
+      octx.lineWidth = 1;
+
+      octx.strokeStyle = "rgba(255, 255, 255, 0.3)";
+      octx.beginPath();
+      octx.moveTo(midX, 0);
+      octx.lineTo(midX, h);
+      octx.moveTo(0, midY);
+      octx.lineTo(w, midY);
+      octx.stroke();
+
+      octx.strokeStyle = "rgba(99, 102, 241, 0.65)";
+      octx.beginPath();
+      octx.moveTo(q4MidX, midY);
+      octx.lineTo(q4MidX, h);
+      octx.moveTo(midX, q4MidY);
+      octx.lineTo(w, q4MidY);
+      octx.stroke();
+
+      octx.setLineDash([]);
+      octx.strokeStyle = "rgba(99, 102, 241, 0.85)";
+      octx.lineWidth = 2;
+      octx.strokeRect(
+        search.x1 * scaleX,
+        search.y1 * scaleY,
+        search.width * scaleX,
+        search.height * scaleY
+      );
+    }
+
     if (settings.tool === "brush" && maskHasContent(maskCtx)) {
       syncBrushOverlayFromMask(maskCtx, octx);
     }
-  }, [bounds, settings.tool]);
+  }, [bounds, settings.tool, showSearchGuides]);
 
   const publishMask = useCallback(
     async (nextRegion: MaskRegion | null = region) => {
@@ -204,6 +258,11 @@ export function MaskCanvas({
     },
     [bounds, onMaskChange]
   );
+
+  useEffect(() => {
+    if (!detectedRegion || !bounds || !imgRef.current?.naturalWidth) return;
+    void applyMarqueeRegion(detectedRegion);
+  }, [detectedRegion, bounds, applyMarqueeRegion]);
 
   const pointerToImage = (clientX: number, clientY: number): ClickPoint | null => {
     const stage = stageRef.current;
@@ -441,6 +500,11 @@ export function MaskCanvas({
           {settings.tool === "marquee"
             ? "Click and drag to select the logo. Drag the box to reposition."
             : "Paint over the logo with your cursor."}
+          {showSearchGuides && (
+            <span className="mt-1 block text-[11px] text-indigo-300/80">
+              White lines = image center · Blue lines = Q4 split · Blue box = auto-detect zone
+            </span>
+          )}
         </p>
         <button
           type="button"
@@ -535,7 +599,7 @@ export function ToolControls({ settings, onChange, disabled }: ToolControlsProps
 
       <div className="rounded-lg border border-white/5 bg-black/20 p-3 text-xs leading-relaxed text-gray-400">
         <p className="font-medium text-gray-300">Select box</p>
-        <p className="mt-1">Drag a rectangle around the logo.</p>
+        <p className="mt-1">Drag a rectangle around the logo, or use Re-detect.</p>
         <p className="mt-2 font-medium text-gray-300">Brush</p>
         <p className="mt-1">Paint directly over the watermark for precise control.</p>
       </div>

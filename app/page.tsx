@@ -1,3 +1,5 @@
+"use client";
+
 import LogoRemoverApp from "@/components/LogoRemoverApp";
 
 export default function Home() {

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { MaskCanvas, ToolControls } from "@/components/ImageEditor";
+import { detectGeminiLogo } from "@/lib/geminiDetect";
 import { removeLogo as runInpaint } from "@/lib/inpaintClient";
 import {
   DEFAULT_EDITOR_SETTINGS,
@@ -20,6 +21,9 @@ export default function LogoRemoverApp() {
   const [region, setRegion] = useState<MaskRegion | null>(null);
   const [settings, setSettings] = useState<EditorSettings>(DEFAULT_EDITOR_SETTINGS);
   const [loading, setLoading] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+  const [detectConfidence, setDetectConfidence] = useState<number | null>(null);
+  const [detectedRegion, setDetectedRegion] = useState<MaskRegion | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
 
@@ -46,6 +50,8 @@ export default function LogoRemoverApp() {
     setError(null);
     setMaskBlob(null);
     setRegion(null);
+    setDetectedRegion(null);
+    setDetectConfidence(null);
     setResultUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;
@@ -58,6 +64,34 @@ export default function LogoRemoverApp() {
     });
     setStep("edit");
   }, []);
+
+  const runAutoDetect = useCallback(async (file: File) => {
+    setDetecting(true);
+    setError(null);
+    setDetectedRegion(null);
+    setDetectConfidence(null);
+
+    try {
+      const result = await detectGeminiLogo(file);
+      if (!result) {
+        setError("Gemini logo not detected. Try manual selection or brush.");
+        return;
+      }
+
+      setDetectedRegion(result.region);
+      setDetectConfidence(result.confidence);
+      setSettings((s) => ({ ...s, tool: "marquee" }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Auto-detection failed");
+    } finally {
+      setDetecting(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step !== "edit" || !imageFile) return;
+    void runAutoDetect(imageFile);
+  }, [step, imageFile, runAutoDetect]);
 
   const onDrop = (event: React.DragEvent) => {
     event.preventDefault();
@@ -100,6 +134,8 @@ export default function LogoRemoverApp() {
     setImageFile(null);
     setMaskBlob(null);
     setRegion(null);
+    setDetectedRegion(null);
+    setDetectConfidence(null);
     setError(null);
     setImageUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
@@ -201,22 +237,39 @@ export default function LogoRemoverApp() {
                 <div>
                   <h2 className="font-semibold text-white">Mark the logo</h2>
                   <p className="text-sm text-gray-400">
-                    Drag a box around the logo, or switch to Brush and paint over it.
+                    Auto-detect scans the bottom-right corner zone (highlighted in blue).
                   </p>
                 </div>
-                <button
-                  onClick={reset}
-                  className="rounded-lg border border-white/10 px-3 py-1.5 text-sm text-gray-300 hover:bg-white/5"
-                >
-                  New image
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => imageFile && void runAutoDetect(imageFile)}
+                    disabled={loading || detecting}
+                    className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-sm text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {detecting ? "Detecting..." : "Re-detect"}
+                  </button>
+                  <button
+                    onClick={reset}
+                    className="rounded-lg border border-white/10 px-3 py-1.5 text-sm text-gray-300 hover:bg-white/5"
+                  >
+                    New image
+                  </button>
+                </div>
               </div>
+
+              {detecting && (
+                <div className="flex items-center gap-2 rounded-lg border border-accent/20 bg-accent/5 px-4 py-2 text-sm text-accent">
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+                  Scanning for Gemini logo...
+                </div>
+              )}
 
               <MaskCanvas
                 imageUrl={imageUrl}
                 settings={settings}
                 onMaskChange={handleMaskChange}
-                disabled={loading}
+                detectedRegion={detectedRegion}
+                disabled={loading || detecting}
               />
 
               {error && (
@@ -254,13 +307,28 @@ export default function LogoRemoverApp() {
                 <p className="mb-2 font-semibold text-gray-300">How it works</p>
                 <ol className="list-decimal space-y-1 pl-4">
                   <li>Upload your image</li>
-                  <li>Select box: drag around the logo</li>
-                  <li>Or use Brush to paint over it</li>
+                  <li>Gemini logo is auto-detected in the corner zone</li>
+                  <li>Adjust selection or use Brush if needed</li>
                   <li>Hit Remove logo</li>
                 </ol>
               </div>
 
-              {region && (
+              {detectConfidence !== null && region && (
+                <div className="glass rounded-xl p-4 text-xs text-gray-400">
+                  <p className="font-semibold text-gray-300">Auto-detect</p>
+                  <p className="mt-1">
+                    Confidence{" "}
+                    <span className="font-mono text-emerald-400">
+                      {(detectConfidence * 100).toFixed(0)}%
+                    </span>
+                  </p>
+                  <p className="mt-1 font-mono">
+                    {Math.round(region.width)}×{Math.round(region.height)}px
+                  </p>
+                </div>
+              )}
+
+              {region && detectConfidence === null && (
                 <div className="glass rounded-xl p-4 text-xs text-gray-400">
                   <p className="font-semibold text-gray-300">Selection</p>
                   <p className="mt-1 font-mono">

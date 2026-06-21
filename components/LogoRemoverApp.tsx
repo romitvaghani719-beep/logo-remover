@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { MaskCanvas, ToolControls } from "@/components/ImageEditor";
+import { removeLogo as runInpaint } from "@/lib/inpaintClient";
 import {
   DEFAULT_EDITOR_SETTINGS,
   type EditorSettings,
@@ -79,22 +80,7 @@ export default function LogoRemoverApp() {
     setError(null);
 
     try {
-      const formData = new FormData();
-      formData.append("image", imageFile);
-      formData.append("mask", maskBlob, "mask.png");
-      formData.append("featherPx", String(settings.featherPx));
-
-      const response = await fetch("/api/inpaint", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || `Request failed (${response.status})`);
-      }
-
-      const blob = await response.blob();
+      const blob = await runInpaint(imageFile, maskBlob, settings.featherPx);
       const url = URL.createObjectURL(blob);
 
       setResultUrl((prev) => {

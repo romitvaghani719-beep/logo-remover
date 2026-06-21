@@ -4,8 +4,20 @@ import { processInpaint } from "@/lib/inpaint";
 export const runtime = "nodejs";
 export const maxDuration = 180;
 
+// Vercel request body limit is ~4.5MB. Client compresses before upload.
 export async function POST(request: NextRequest) {
   try {
+    const contentLength = Number(request.headers.get("content-length") ?? 0);
+    if (contentLength > 4_400_000) {
+      return NextResponse.json(
+        {
+          error:
+            "Upload too large for serverless (max ~4MB). The app will use browser inpaint automatically.",
+        },
+        { status: 413 }
+      );
+    }
+
     const formData = await request.formData();
     const imageFile = formData.get("image");
     const maskFile = formData.get("mask");

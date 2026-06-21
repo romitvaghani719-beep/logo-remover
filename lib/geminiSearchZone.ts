@@ -1,11 +1,9 @@
 import type { MaskRegion } from "@/types";
 
-/** Gemini watermark sits in Q4 (bottom-right), then Q4.4 (bottom-right of that). */
+/** Gemini watermark sits in the bottom-right corner (last 12% × 12%). */
+export const CORNER_SEARCH_FRACTION = 0.12;
+
 export interface GeminiSearchZone {
-  midX: number;
-  midY: number;
-  q4MidX: number;
-  q4MidY: number;
   searchRegion: MaskRegion;
 }
 
@@ -15,21 +13,12 @@ export function getGeminiSearchZone(
   tplW = 0,
   tplH = 0
 ): GeminiSearchZone {
-  const midX = Math.round(imgW / 2);
-  const midY = Math.round(imgH / 2);
-  const q4MidX = Math.round((imgW * 3) / 4);
-  const q4MidY = Math.round((imgH * 3) / 4);
-
-  const x1 = q4MidX;
-  const y1 = q4MidY;
+  const x1 = Math.round(imgW * (1 - CORNER_SEARCH_FRACTION));
+  const y1 = Math.round(imgH * (1 - CORNER_SEARCH_FRACTION));
   const x2 = Math.max(x1, imgW - tplW);
   const y2 = Math.max(y1, imgH - tplH);
 
   return {
-    midX,
-    midY,
-    q4MidX,
-    q4MidY,
     searchRegion: {
       x1,
       y1,

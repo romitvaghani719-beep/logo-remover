@@ -19,7 +19,7 @@ import {
   syncBrushOverlayFromMask,
   type RenderedImageBounds,
 } from "@/lib/maskGeometry";
-import { getGeminiSearchZone } from "@/lib/geminiSearchZone";
+import { CORNER_SEARCH_FRACTION, getGeminiSearchZone } from "@/lib/geminiSearchZone";
 
 interface MaskCanvasProps {
   imageUrl: string;
@@ -110,11 +110,8 @@ export function MaskCanvas({
       const zone = getGeminiSearchZone(img.naturalWidth, img.naturalHeight);
       const scaleX = w / img.naturalWidth;
       const scaleY = h / img.naturalHeight;
-
-      const midX = zone.midX * scaleX;
-      const midY = zone.midY * scaleY;
-      const q4MidX = zone.q4MidX * scaleX;
-      const q4MidY = zone.q4MidY * scaleY;
+      const cornerX = img.naturalWidth * (1 - CORNER_SEARCH_FRACTION) * scaleX;
+      const cornerY = img.naturalHeight * (1 - CORNER_SEARCH_FRACTION) * scaleY;
       const search = zone.searchRegion;
 
       octx.fillStyle = "rgba(99, 102, 241, 0.1)";
@@ -127,21 +124,12 @@ export function MaskCanvas({
 
       octx.setLineDash([8, 5]);
       octx.lineWidth = 1;
-
-      octx.strokeStyle = "rgba(255, 255, 255, 0.3)";
-      octx.beginPath();
-      octx.moveTo(midX, 0);
-      octx.lineTo(midX, h);
-      octx.moveTo(0, midY);
-      octx.lineTo(w, midY);
-      octx.stroke();
-
       octx.strokeStyle = "rgba(99, 102, 241, 0.65)";
       octx.beginPath();
-      octx.moveTo(q4MidX, midY);
-      octx.lineTo(q4MidX, h);
-      octx.moveTo(midX, q4MidY);
-      octx.lineTo(w, q4MidY);
+      octx.moveTo(cornerX, 0);
+      octx.lineTo(cornerX, h);
+      octx.moveTo(0, cornerY);
+      octx.lineTo(w, cornerY);
       octx.stroke();
 
       octx.setLineDash([]);
@@ -502,7 +490,7 @@ export function MaskCanvas({
             : "Paint over the logo with your cursor."}
           {showSearchGuides && (
             <span className="mt-1 block text-[11px] text-indigo-300/80">
-              White lines = image center · Blue lines = Q4 split · Blue box = auto-detect zone
+              Blue lines = 12% corner boundary · Blue box = auto-detect zone
             </span>
           )}
         </p>

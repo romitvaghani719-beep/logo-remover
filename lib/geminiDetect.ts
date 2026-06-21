@@ -13,15 +13,21 @@ const TEMPLATE_URLS = [
   "/templates/gemini-96.png",
 ];
 
-const SCALE_MULTIPLIERS = [
-  0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95,
-  1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.4, 1.5,
-];
+const SCALE_MULTIPLIERS = [0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15];
 
 const MIN_SCORE = 0.38;
 const MIN_RELATIVE_GAP = 1.1;
 const PAD_RATIO = 0.08;
 const MAX_LOGO_FRACTION = 0.14;
+const EXPECTED_LOGO_FRACTION = 0.08;
+const TEMPLATE_SIZE_TOLERANCE = 0.5;
+
+const COARSE_STRIDE = 4;
+const FINE_STRIDE = 2;
+const FINE_RADIUS = 8;
+const FULL_RES_REFINE_PX = 10;
+const PASS2_TOP_N = 20;
+const PASS3_TOP_N = 5;
 
 interface TemplateChannel {
   mask: Float32Array;
@@ -41,6 +47,13 @@ interface PreparedTemplate {
   shape: TemplateChannel;
   edge: TemplateChannel;
   gray: TemplateChannel;
+}
+
+interface MatchCandidate {
+  x: number;
+  y: number;
+  tpl: PreparedTemplate;
+  pass2Score: number;
 }
 
 async function loadImageBitmap(url: string): Promise<ImageBitmap> {
@@ -306,6 +319,31 @@ function channelScore(
   return useAbs ? Math.abs(score) : score;
 }
 
+function edgeOnlyScore(
+  edges: Float32Array,
+  imgW: number,
+  imgH: number,
+  tpl: PreparedTemplate,
+  x: number,
+  y: number
+): number {
+  return channelScore(edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true);
+}
+
+function edgeShapeScore(
+  contrast: Float32Array,
+  edges: Float32Array,
+  imgW: number,
+  imgH: number,
+  tpl: PreparedTemplate,
+  x: number,
+  y: number
+): number {
+  const edge = channelScore(edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true);
+  const shape = channelScore(contrast, imgW, imgH, tpl.shape, tpl.width, tpl.height, x, y, true);
+  return Math.max(edge, shape * 0.98);
+}
+
 function combinedScore(
   gray: Float32Array,
   contrast: Float32Array,
@@ -326,10 +364,35 @@ function combinedScore(
   return Math.max(shape, edge * 0.98, lum * 0.92);
 }
 
+function insertTopCandidate(
+  top: MatchCandidate[],
+  candidate: MatchCandidate,
+  limit: number
+): void {
+  if (candidate.pass2Score < 0) return;
+
+  if (top.length < limit) {
+    top.push(candidate);
+    top.sort((a, b) => b.pass2Score - a.pass2Score);
+    return;
+  }
+
+  if (candidate.pass2Score <= top[limit - 1].pass2Score) return;
+
+  top[limit - 1] = candidate;
+  top.sort((a, b) => b.pass2Score - a.pass2Score);
+}
+
 function adjustedCandidateScore(score: number, tpl: PreparedTemplate, imgMinEdge: number): number {
   const sizeRatio = tpl.tightW / (imgMinEdge * MAX_LOGO_FRACTION);
   const sizePenalty = sizeRatio > 1 ? 1 / (1 + (sizeRatio - 1) * 0.65) : 1;
   return score * sizePenalty;
+}
+
+function shouldSkipTemplateSize(tpl: PreparedTemplate, imgMinEdge: number): boolean {
+  const expectedLogo = imgMinEdge * EXPECTED_LOGO_FRACTION;
+  const tplSize = Math.max(tpl.tightW, tpl.tightH);
+  return Math.abs(tplSize - expectedLogo) > expectedLogo * TEMPLATE_SIZE_TOLERANCE;
 }
 
 function cornerAnchoredPositions(
@@ -357,27 +420,49 @@ function cornerAnchoredPositions(
   return positions;
 }
 
-function searchTemplate(
-  gray: Float32Array,
-  contrast: Float32Array,
+function searchCoarseEdgeOnly(
   edges: Float32Array,
   imgW: number,
   imgH: number,
   tpl: PreparedTemplate,
   stride: number,
-  roi?: { x1: number; y1: number; x2: number; y2: number }
+  roi: { x1: number; y1: number; x2: number; y2: number }
 ): { score: number; x: number; y: number } {
   let bestScore = -1;
-  let bestX = 0;
-  let bestY = 0;
+  let bestX = roi.x1;
+  let bestY = roi.y1;
 
-  const x1 = roi?.x1 ?? 0;
-  const y1 = roi?.y1 ?? 0;
-  const x2 = roi?.x2 ?? imgW - tpl.width;
-  const y2 = roi?.y2 ?? imgH - tpl.height;
+  for (let y = roi.y1; y <= roi.y2; y += stride) {
+    for (let x = roi.x1; x <= roi.x2; x += stride) {
+      const score = edgeOnlyScore(edges, imgW, imgH, tpl, x, y);
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
 
-  for (let y = y1; y <= y2; y += stride) {
-    for (let x = x1; x <= x2; x += stride) {
+  return { score: bestScore, x: bestX, y: bestY };
+}
+
+function refineWithFullScore(
+  gray: Float32Array,
+  contrast: Float32Array,
+  edges: Float32Array,
+  imgW: number,
+  imgH: number,
+  candidate: MatchCandidate,
+  roi: { x1: number; y1: number; x2: number; y2: number }
+): { score: number; x: number; y: number } {
+  const tpl = candidate.tpl;
+  let bestScore = combinedScore(gray, contrast, edges, imgW, imgH, tpl, candidate.x, candidate.y);
+  let bestX = candidate.x;
+  let bestY = candidate.y;
+
+  for (let y = roi.y1; y <= roi.y2; y += FINE_STRIDE) {
+    for (let x = roi.x1; x <= roi.x2; x += FINE_STRIDE) {
+      if (x === candidate.x && y === candidate.y) continue;
       const score = combinedScore(gray, contrast, edges, imgW, imgH, tpl, x, y);
       if (score > bestScore) {
         bestScore = score;
@@ -390,29 +475,148 @@ function searchTemplate(
   return { score: bestScore, x: bestX, y: bestY };
 }
 
-function searchCornerAnchored(
+function collectPass2Candidates(
+  contrast: Float32Array,
+  edges: Float32Array,
+  imgW: number,
+  imgH: number,
+  templates: PreparedTemplate[],
+  tplLimit: number,
+  imgMinEdge: number
+): MatchCandidate[] {
+  const pass2Pool: MatchCandidate[] = [];
+  const cornerGuaranteed: MatchCandidate[] = [];
+
+  for (const tpl of templates) {
+    if (tpl.width >= imgW || tpl.height >= imgH) continue;
+    if (tpl.tightW > tplLimit || tpl.tightH > tplLimit) continue;
+    if (shouldSkipTemplateSize(tpl, imgMinEdge)) continue;
+
+    const searchRoi = getGeminiSearchRoi(imgW, imgH, tpl.width, tpl.height);
+    if (searchRoi.x2 < searchRoi.x1 || searchRoi.y2 < searchRoi.y1) continue;
+
+    let bestCornerEdge = -1;
+    let cornerX = searchRoi.x1;
+    let cornerY = searchRoi.y1;
+
+    for (const pos of cornerAnchoredPositions(imgW, imgH, tpl.width, tpl.height, searchRoi)) {
+      const edgeScore = edgeOnlyScore(edges, imgW, imgH, tpl, pos.x, pos.y);
+      if (edgeScore > bestCornerEdge) {
+        bestCornerEdge = edgeScore;
+        cornerX = pos.x;
+        cornerY = pos.y;
+      }
+    }
+
+    if (bestCornerEdge >= 0) {
+      cornerGuaranteed.push({
+        x: cornerX,
+        y: cornerY,
+        tpl,
+        pass2Score: edgeShapeScore(contrast, edges, imgW, imgH, tpl, cornerX, cornerY),
+      });
+    }
+
+    const coarseEdge = searchCoarseEdgeOnly(edges, imgW, imgH, tpl, COARSE_STRIDE, searchRoi);
+    if (coarseEdge.score >= 0) {
+      insertTopCandidate(
+        pass2Pool,
+        {
+          x: coarseEdge.x,
+          y: coarseEdge.y,
+          tpl,
+          pass2Score: edgeShapeScore(
+            contrast,
+            edges,
+            imgW,
+            imgH,
+            tpl,
+            coarseEdge.x,
+            coarseEdge.y
+          ),
+        },
+        PASS2_TOP_N
+      );
+    }
+  }
+
+  for (const corner of cornerGuaranteed) {
+    insertTopCandidate(pass2Pool, corner, PASS2_TOP_N);
+  }
+
+  return pass2Pool.slice(0, PASS2_TOP_N);
+}
+
+function runCascadedSearch(
   gray: Float32Array,
   contrast: Float32Array,
   edges: Float32Array,
   imgW: number,
   imgH: number,
-  tpl: PreparedTemplate,
-  roi: { x1: number; y1: number; x2: number; y2: number }
-): { score: number; x: number; y: number } {
-  let bestScore = -1;
-  let bestX = 0;
-  let bestY = 0;
+  templates: PreparedTemplate[],
+  tplLimit: number,
+  imgMinEdge: number
+): {
+  best: { score: number; adjusted: number; x: number; y: number; tpl: PreparedTemplate };
+  secondRaw: number;
+} {
+  const pass2 = collectPass2Candidates(
+    contrast,
+    edges,
+    imgW,
+    imgH,
+    templates,
+    tplLimit,
+    imgMinEdge
+  );
+  const pass3 = pass2.slice(0, PASS3_TOP_N);
 
-  for (const pos of cornerAnchoredPositions(imgW, imgH, tpl.width, tpl.height, roi)) {
-    const score = combinedScore(gray, contrast, edges, imgW, imgH, tpl, pos.x, pos.y);
-    if (score > bestScore) {
-      bestScore = score;
-      bestX = pos.x;
-      bestY = pos.y;
+  let globalBest = {
+    score: -1,
+    adjusted: -1,
+    x: 0,
+    y: 0,
+    tpl: templates[0],
+  };
+  let globalSecondRaw = -1;
+
+  for (const candidate of pass3) {
+    const searchRoi = getGeminiSearchRoi(imgW, imgH, candidate.tpl.width, candidate.tpl.height);
+    const fineRoi = {
+      x1: Math.max(searchRoi.x1, candidate.x - FINE_RADIUS),
+      y1: Math.max(searchRoi.y1, candidate.y - FINE_RADIUS),
+      x2: Math.min(searchRoi.x2, candidate.x + FINE_RADIUS),
+      y2: Math.min(searchRoi.y2, candidate.y + FINE_RADIUS),
+    };
+
+    const refined = refineWithFullScore(
+      gray,
+      contrast,
+      edges,
+      imgW,
+      imgH,
+      candidate,
+      fineRoi
+    );
+    const adjusted = adjustedCandidateScore(refined.score, candidate.tpl, imgMinEdge);
+
+    if (adjusted > globalBest.adjusted) {
+      if (globalBest.score > globalSecondRaw) {
+        globalSecondRaw = globalBest.score;
+      }
+      globalBest = {
+        score: refined.score,
+        adjusted,
+        x: refined.x,
+        y: refined.y,
+        tpl: candidate.tpl,
+      };
+    } else if (refined.score > globalSecondRaw) {
+      globalSecondRaw = refined.score;
     }
   }
 
-  return { score: bestScore, x: bestX, y: bestY };
+  return { best: globalBest, secondRaw: globalSecondRaw };
 }
 
 function refineTightBoundsFromPixels(
@@ -556,7 +760,7 @@ function regionFromBox(
 
 let templatesCache: PreparedTemplate[] | null = null;
 let templatesCacheVersion = 0;
-const TEMPLATE_CACHE_VERSION = 5;
+const TEMPLATE_CACHE_VERSION = 6;
 
 async function getTemplates() {
   if (!templatesCache || templatesCacheVersion !== TEMPLATE_CACHE_VERSION) {
@@ -588,85 +792,16 @@ export async function detectGeminiLogo(
   const tplLimit = maxTemplateSize(searchW, searchH);
   const imgMinEdge = Math.min(searchW, searchH);
 
-  let globalBest = {
-    score: -1,
-    adjusted: -1,
-    x: 0,
-    y: 0,
-    tpl: templates[0],
-  };
-  let globalSecond = -1;
-  let globalSecondRaw = -1;
-
-  for (const tpl of templates) {
-    if (tpl.width >= searchW || tpl.height >= searchH) continue;
-    if (tpl.tightW > tplLimit || tpl.tightH > tplLimit) continue;
-
-    const searchRoi = getGeminiSearchRoi(searchW, searchH, tpl.width, tpl.height);
-    if (searchRoi.x2 < searchRoi.x1 || searchRoi.y2 < searchRoi.y1) continue;
-
-    const corner = searchCornerAnchored(gray, contrast, edges, searchW, searchH, tpl, searchRoi);
-    const coarse = searchTemplate(
-      gray,
-      contrast,
-      edges,
-      searchW,
-      searchH,
-      tpl,
-      4,
-      searchRoi
-    );
-
-    const seed =
-      corner.score >= coarse.score
-        ? corner
-        : { score: coarse.score, x: coarse.x, y: coarse.y };
-
-    const fineRadius = 8;
-    const roi = {
-      x1: Math.max(searchRoi.x1, seed.x - fineRadius),
-      y1: Math.max(searchRoi.y1, seed.y - fineRadius),
-      x2: Math.min(searchRoi.x2, seed.x + fineRadius),
-      y2: Math.min(searchRoi.y2, seed.y + fineRadius),
-    };
-
-    const fine = searchTemplate(gray, contrast, edges, searchW, searchH, tpl, 1, roi);
-    const candidateScore = Math.max(corner.score, coarse.score, fine.score);
-    const candidateX =
-      fine.score >= corner.score && fine.score >= coarse.score
-        ? fine.x
-        : corner.score >= coarse.score
-          ? corner.x
-          : coarse.x;
-    const candidateY =
-      fine.score >= corner.score && fine.score >= coarse.score
-        ? fine.y
-        : corner.score >= coarse.score
-          ? corner.y
-          : coarse.y;
-    const adjusted = adjustedCandidateScore(candidateScore, tpl, imgMinEdge);
-
-    if (adjusted > globalSecond) {
-      if (adjusted >= globalBest.adjusted) {
-        globalSecondRaw = globalBest.score;
-        globalSecond = globalBest.adjusted;
-        globalBest = {
-          score: candidateScore,
-          adjusted,
-          x: candidateX,
-          y: candidateY,
-          tpl,
-        };
-      } else {
-        globalSecond = adjusted;
-        if (candidateScore > globalSecondRaw) {
-          globalSecondRaw = candidateScore;
-        }
-      }
-    } else if (candidateScore > globalSecondRaw) {
-      globalSecondRaw = candidateScore;
-    }
-  }
+  const { best: globalBest, secondRaw: globalSecondRaw } = runCascadedSearch(
+    gray,
+    contrast,
+    edges,
+    searchW,
+    searchH,
+    templates,
+    tplLimit,
+    imgMinEdge
+  );
 
   if (!isAcceptableScore(globalBest.score, globalSecondRaw)) {
     bitmap.close();
@@ -697,40 +832,28 @@ export async function detectGeminiLogo(
 
     if (fullTpl.shape.count > 0 && fullTpl.width < naturalW && fullTpl.height < naturalH) {
       const zoneRoi = getGeminiSearchRoi(naturalW, naturalH, fullTpl.width, fullTpl.height);
-      const corner = searchCornerAnchored(
-        fullGray,
-        fullContrast,
-        fullEdges,
-        naturalW,
-        naturalH,
-        fullTpl,
-        zoneRoi
-      );
-      const margin = Math.max(16, Math.round(fullTpl.tightW * 0.6));
       const roi = {
-        x1: Math.max(zoneRoi.x1, finalX - margin),
-        y1: Math.max(zoneRoi.y1, finalY - margin),
-        x2: Math.min(zoneRoi.x2, finalX + margin),
-        y2: Math.min(zoneRoi.y2, finalY + margin),
+        x1: Math.max(zoneRoi.x1, finalX - FULL_RES_REFINE_PX),
+        y1: Math.max(zoneRoi.y1, finalY - FULL_RES_REFINE_PX),
+        x2: Math.min(zoneRoi.x2, finalX + FULL_RES_REFINE_PX),
+        y2: Math.min(zoneRoi.y2, finalY + FULL_RES_REFINE_PX),
       };
 
       if (roi.x2 >= roi.x1 && roi.y2 >= roi.y1) {
-        const refined = searchTemplate(
+        const refined = refineWithFullScore(
           fullGray,
           fullContrast,
           fullEdges,
           naturalW,
           naturalH,
-          fullTpl,
-          1,
+          { x: finalX, y: finalY, tpl: fullTpl, pass2Score: finalScore },
           roi
         );
-        const bestRefine = corner.score >= refined.score ? corner : refined;
-        if (bestRefine.score >= finalScore * 0.82) {
-          finalX = bestRefine.x;
-          finalY = bestRefine.y;
+        if (refined.score >= finalScore * 0.82) {
+          finalX = refined.x;
+          finalY = refined.y;
           finalTpl = fullTpl;
-          finalScore = bestRefine.score;
+          finalScore = refined.score;
         }
       }
     }

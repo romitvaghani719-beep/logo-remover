@@ -1,5 +1,5 @@
 import type { MaskRegion } from "@/types";
-import { getGeminiSearchRoi, getGeminiSearchZone } from "@/lib/geminiSearchZone";
+import { getGeminiSearchRoi } from "@/lib/geminiSearchZone";
 
 export interface GeminiDetectionResult {
   region: MaskRegion;
@@ -43,23 +43,28 @@ interface PreparedTemplate {
   gray: TemplateChannel;
 }
 
-function loadImage(url: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`Failed to load template: ${url}`));
-    img.src = url;
-  });
+async function loadImageBitmap(url: string): Promise<ImageBitmap> {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to load template: ${url}`);
+  const blob = await resp.blob();
+  return createImageBitmap(blob);
 }
 
-function imageToImageData(img: HTMLImageElement, width: number, height: number): ImageData {
+function bitmapToImageData(source: ImageBitmap, width: number, height: number): ImageData {
+  if (typeof OffscreenCanvas !== "undefined") {
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas not supported");
+    ctx.drawImage(source, 0, 0, width, height);
+    return ctx.getImageData(0, 0, width, height);
+  }
+
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("Canvas not supported");
-  ctx.drawImage(img, 0, 0, width, height);
+  ctx.drawImage(source, 0, 0, width, height);
   return ctx.getImageData(0, 0, width, height);
 }
 
@@ -201,36 +206,22 @@ async function buildTemplates(): Promise<PreparedTemplate[]> {
   const templates: PreparedTemplate[] = [];
 
   for (const url of TEMPLATE_URLS) {
-    const img = await loadImage(url);
-    const baseSize = img.naturalWidth;
+    const bitmap = await loadImageBitmap(url);
+    const baseSize = bitmap.width;
 
     for (const multiplier of SCALE_MULTIPLIERS) {
       const size = Math.max(16, Math.round(baseSize * multiplier));
-      const data = imageToImageData(img, size, size);
+      const data = bitmapToImageData(bitmap, size, size);
       const prepared = prepareTemplateFromImageData(data, baseSize, multiplier);
       if (prepared.shape.count > 0) {
         templates.push(prepared);
       }
     }
+
+    bitmap.close();
   }
 
   return templates.sort((a, b) => a.width - b.width);
-}
-
-function fileToImage(file: Blob): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(img);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Failed to load image"));
-    };
-    img.src = url;
-  });
 }
 
 function grayToUnit(gray: Float32Array): Float32Array {
@@ -377,7 +368,6 @@ function searchTemplate(
   roi?: { x1: number; y1: number; x2: number; y2: number }
 ): { score: number; x: number; y: number } {
   let bestScore = -1;
-  let secondScore = -1;
   let bestX = 0;
   let bestY = 0;
 
@@ -390,12 +380,9 @@ function searchTemplate(
     for (let x = x1; x <= x2; x += stride) {
       const score = combinedScore(gray, contrast, edges, imgW, imgH, tpl, x, y);
       if (score > bestScore) {
-        secondScore = bestScore;
         bestScore = score;
         bestX = x;
         bestY = y;
-      } else if (score > secondScore) {
-        secondScore = score;
       }
     }
   }
@@ -569,7 +556,7 @@ function regionFromBox(
 
 let templatesCache: PreparedTemplate[] | null = null;
 let templatesCacheVersion = 0;
-const TEMPLATE_CACHE_VERSION = 3;
+const TEMPLATE_CACHE_VERSION = 5;
 
 async function getTemplates() {
   if (!templatesCache || templatesCacheVersion !== TEMPLATE_CACHE_VERSION) {
@@ -582,16 +569,19 @@ async function getTemplates() {
 export async function detectGeminiLogo(
   imageSource: Blob | File
 ): Promise<GeminiDetectionResult | null> {
-  const [img, templates] = await Promise.all([fileToImage(imageSource), getTemplates()]);
+  const [bitmap, templates] = await Promise.all([
+    createImageBitmap(imageSource),
+    getTemplates(),
+  ]);
 
-  const naturalW = img.naturalWidth;
-  const naturalH = img.naturalHeight;
+  const naturalW = bitmap.width;
+  const naturalH = bitmap.height;
   const maxSearchEdge = 1600;
   const searchScale = Math.min(1, maxSearchEdge / Math.max(naturalW, naturalH));
   const searchW = Math.max(1, Math.round(naturalW * searchScale));
   const searchH = Math.max(1, Math.round(naturalH * searchScale));
 
-  const searchData = imageToImageData(img, searchW, searchH);
+  const searchData = bitmapToImageData(bitmap, searchW, searchH);
   const gray = toGrayscale(searchData);
   const contrast = toLocalContrast(gray, searchW, searchH);
   const edges = sobelMagnitudes(grayToUnit(gray), searchW, searchH);
@@ -679,6 +669,7 @@ export async function detectGeminiLogo(
   }
 
   if (!isAcceptableScore(globalBest.score, globalSecondRaw)) {
+    bitmap.close();
     return null;
   }
 
@@ -689,19 +680,20 @@ export async function detectGeminiLogo(
   let fullGray: Float32Array | undefined;
 
   if (searchScale < 0.99) {
-    const fullData = imageToImageData(img, naturalW, naturalH);
+    const fullData = bitmapToImageData(bitmap, naturalW, naturalH);
     fullGray = toGrayscale(fullData);
     const fullContrast = toLocalContrast(fullGray, naturalW, naturalH);
     const fullEdges = sobelMagnitudes(grayToUnit(fullGray), naturalW, naturalH);
     const fullTplSize = Math.max(16, Math.round(globalBest.tpl.width / searchScale));
     const baseUrl =
       globalBest.tpl.baseSize === 48 ? TEMPLATE_URLS[0] : TEMPLATE_URLS[1];
-    const baseImg = await loadImage(baseUrl);
+    const baseBitmap = await loadImageBitmap(baseUrl);
     const fullTpl = prepareTemplateFromImageData(
-      imageToImageData(baseImg, fullTplSize, fullTplSize),
+      bitmapToImageData(baseBitmap, fullTplSize, fullTplSize),
       globalBest.tpl.baseSize,
       globalBest.tpl.scale
     );
+    baseBitmap.close();
 
     if (fullTpl.shape.count > 0 && fullTpl.width < naturalW && fullTpl.height < naturalH) {
       const zoneRoi = getGeminiSearchRoi(naturalW, naturalH, fullTpl.width, fullTpl.height);
@@ -745,6 +737,8 @@ export async function detectGeminiLogo(
   } else {
     fullGray = gray;
   }
+
+  bitmap.close();
 
   return {
     region: regionFromDetection(finalX, finalY, finalTpl, naturalW, naturalH, fullGray),

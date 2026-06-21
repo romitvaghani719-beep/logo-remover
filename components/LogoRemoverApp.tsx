@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { MaskCanvas, ToolControls } from "@/components/ImageEditor";
-import { detectGeminiLogo } from "@/lib/geminiDetect";
+import { detectGeminiLogo } from "@/lib/geminiDetectClient";
 import { removeLogo as runInpaint } from "@/lib/inpaintClient";
 import {
   DEFAULT_EDITOR_SETTINGS,

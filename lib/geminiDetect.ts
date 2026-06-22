@@ -6,7 +6,6 @@ import {
   type DetectionDebugStep,
   defaultZoneDescription,
   drawMatchOnImage,
-  drawRegionOnNaturalImage,
   drawZonesOnImage,
   floatFieldToStep,
   imageDataToStep,
@@ -36,6 +35,8 @@ const SCALE_MULTIPLIERS = [0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15];
 const MIN_SCORE = 0.38;
 const MIN_RELATIVE_GAP = 1.1;
 const PAD_RATIO = 0.08;
+/** Tiny fixed pad on the final inpaint mask — keeps step 10 aligned with step 9. */
+const FINAL_MASK_PAD_PX = 2;
 const MAX_LOGO_FRACTION = 0.14;
 const EXPECTED_LOGO_FRACTION = 0.08;
 const TEMPLATE_SIZE_TOLERANCE = 0.5;
@@ -679,83 +680,15 @@ function runCascadedSearch(
   return { best: globalBest, secondRaw: globalSecondRaw };
 }
 
-function refineTightBoundsFromPixels(
-  gray: Float32Array,
+function regionFromTightMatch(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
   imgW: number,
-  imgH: number,
-  approxX: number,
-  approxY: number,
-  approxW: number,
-  approxH: number
-): { x: number; y: number; w: number; h: number } {
-  const pad = Math.max(8, Math.round(Math.max(approxW, approxH) * 0.45));
-  const x1 = Math.max(0, approxX - pad);
-  const y1 = Math.max(0, approxY - pad);
-  const x2 = Math.min(imgW - 1, approxX + approxW + pad);
-  const y2 = Math.min(imgH - 1, approxY + approxH + pad);
-
-  let localSum = 0;
-  let localN = 0;
-  for (let y = y1; y <= y2; y++) {
-    for (let x = x1; x <= x2; x++) {
-      localSum += gray[y * imgW + x];
-      localN++;
-    }
-  }
-  const localMean = localSum / localN;
-
-  let brightSum = 0;
-  let brightN = 0;
-  const samples: number[] = [];
-  for (let y = y1; y <= y2; y++) {
-    for (let x = x1; x <= x2; x++) {
-      const v = gray[y * imgW + x];
-      if (v > localMean + 8) {
-        brightSum += v;
-        brightN++;
-        samples.push(v);
-      }
-    }
-  }
-
-  const threshold =
-    brightN > 12
-      ? brightSum / brightN - 6
-      : localMean +
-        Math.max(
-          12,
-          ((samples.length > 0 ? Math.max(...samples) : localMean + 18) - localMean) * 0.35
-        );
-
-  let minX = imgW;
-  let minY = imgH;
-  let maxX = -1;
-  let maxY = -1;
-  let hits = 0;
-
-  for (let y = y1; y <= y2; y++) {
-    for (let x = x1; x <= x2; x++) {
-      if (gray[y * imgW + x] < threshold) continue;
-      hits++;
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-    }
-  }
-
-  if (hits < 6 || maxX < minX || maxY < minY) {
-    return { x: approxX, y: approxY, w: approxW, h: approxH };
-  }
-
-  const blobW = maxX - minX + 1;
-  const blobH = maxY - minY + 1;
-  const maxSide = Math.max(approxW, approxH) * 1.8;
-  if (blobW > maxSide || blobH > maxSide) {
-    return { x: approxX, y: approxY, w: approxW, h: approxH };
-  }
-
-  return { x: minX, y: minY, w: blobW, h: blobH };
+  imgH: number
+): MaskRegion {
+  return regionFromBox(x, y, w, h, imgW, imgH, PAD_RATIO, FINAL_MASK_PAD_PX);
 }
 
 function regionFromDetection(
@@ -763,23 +696,29 @@ function regionFromDetection(
   matchY: number,
   tpl: PreparedTemplate,
   imgW: number,
-  imgH: number,
-  gray?: Float32Array
+  imgH: number
 ): MaskRegion {
-  let x = Math.round(matchX + tpl.tightX);
-  let y = Math.round(matchY + tpl.tightY);
-  let w = tpl.tightW;
-  let h = tpl.tightH;
+  const x = Math.round(matchX + tpl.tightX);
+  const y = Math.round(matchY + tpl.tightY);
+  const w = tpl.tightW;
+  const h = tpl.tightH;
+  return regionFromTightMatch(x, y, w, h, imgW, imgH);
+}
 
-  if (gray) {
-    const refined = refineTightBoundsFromPixels(gray, imgW, imgH, x, y, w, h);
-    x = refined.x;
-    y = refined.y;
-    w = refined.w;
-    h = refined.h;
-  }
-
-  return regionFromBox(x, y, w, h, imgW, imgH);
+function naturalTightRegionFromSearchMatch(
+  refinedMatchX: number,
+  refinedMatchY: number,
+  searchTpl: PreparedTemplate,
+  searchScale: number,
+  imgW: number,
+  imgH: number
+): MaskRegion {
+  const inv = 1 / searchScale;
+  const x = Math.round(refinedMatchX + searchTpl.tightX * inv);
+  const y = Math.round(refinedMatchY + searchTpl.tightY * inv);
+  const w = Math.max(8, Math.round(searchTpl.tightW * inv));
+  const h = Math.max(8, Math.round(searchTpl.tightH * inv));
+  return regionFromTightMatch(x, y, w, h, imgW, imgH);
 }
 
 function maxTemplateSize(imgW: number, imgH: number): number {
@@ -799,10 +738,11 @@ function regionFromBox(
   h: number,
   imgW: number,
   imgH: number,
-  padRatio = PAD_RATIO
+  padRatio = PAD_RATIO,
+  fixedPadPx?: number
 ): MaskRegion {
-  const padX = Math.round(w * padRatio);
-  const padY = Math.round(h * padRatio);
+  const padX = fixedPadPx !== undefined ? fixedPadPx : Math.round(w * padRatio);
+  const padY = fixedPadPx !== undefined ? fixedPadPx : Math.round(h * padRatio);
   const x1 = Math.max(0, x - padX);
   const y1 = Math.max(0, y - padY);
   const x2 = Math.min(imgW, x + w + padX);
@@ -1041,12 +981,12 @@ export async function detectGeminiLogo(
   let finalX = Math.round(globalBest.x / searchScale);
   let finalY = Math.round(globalBest.y / searchScale);
   let finalTpl = globalBest.tpl;
+  const searchMatchTpl = globalBest.tpl;
   let finalScore = globalBest.score;
-  let fullGray: Float32Array | undefined;
 
   if (searchScale < 0.99) {
     const fullData = bitmapToImageData(bitmap, naturalW, naturalH);
-    fullGray = toGrayscale(fullData);
+    const fullGray = toGrayscale(fullData);
     const fullContrast = toLocalContrast(fullGray, naturalW, naturalH);
     const fullEdges = sobelMagnitudes(grayToUnit(fullGray), naturalW, naturalH);
     const fullTplSize = Math.max(16, Math.round(globalBest.tpl.width / searchScale));
@@ -1103,6 +1043,15 @@ export async function detectGeminiLogo(
                 dashed: true,
               },
               {
+                x: refined.x + Math.round(searchMatchTpl.tightX / searchScale),
+                y: refined.y + Math.round(searchMatchTpl.tightY / searchScale),
+                w: Math.max(8, Math.round(searchMatchTpl.tightW / searchScale)),
+                h: Math.max(8, Math.round(searchMatchTpl.tightH / searchScale)),
+                color: "#ef4444",
+                label: "tight logo",
+                dashed: true,
+              },
+              {
                 x: refined.x,
                 y: refined.y,
                 w: fullTpl.width,
@@ -1122,20 +1071,65 @@ export async function detectGeminiLogo(
         }
       }
     }
-  } else {
-    fullGray = gray;
   }
 
-  const region = regionFromDetection(finalX, finalY, finalTpl, naturalW, naturalH, fullGray);
+  const region =
+    searchScale < 0.99
+      ? naturalTightRegionFromSearchMatch(
+          finalX,
+          finalY,
+          searchMatchTpl,
+          searchScale,
+          naturalW,
+          naturalH
+        )
+      : regionFromDetection(finalX, finalY, finalTpl, naturalW, naturalH);
+
+  const inv = 1 / searchScale;
+  const tightX =
+    searchScale < 0.99
+      ? Math.round(finalX + searchMatchTpl.tightX * inv)
+      : Math.round(finalX + finalTpl.tightX);
+  const tightY =
+    searchScale < 0.99
+      ? Math.round(finalY + searchMatchTpl.tightY * inv)
+      : Math.round(finalY + finalTpl.tightY);
+  const tightW =
+    searchScale < 0.99
+      ? Math.max(8, Math.round(searchMatchTpl.tightW * inv))
+      : finalTpl.tightW;
+  const tightH =
+    searchScale < 0.99
+      ? Math.max(8, Math.round(searchMatchTpl.tightH * inv))
+      : finalTpl.tightH;
+
   await pushDebug(
     debug,
-    drawRegionOnNaturalImage(
+    drawMatchOnImage(
       "10-final-mask",
       "10. Final mask region",
-      `Padded selection sent to inpaint (${Math.round(region.width)}×${Math.round(region.height)}px, confidence ${(finalScore * 100).toFixed(0)}%).`,
+      `Same tight bounds as step 9 + ${FINAL_MASK_PAD_PX}px pad (${Math.round(region.width)}×${Math.round(region.height)}px, confidence ${(finalScore * 100).toFixed(0)}%).`,
       naturalData,
-      region,
-      "#22c55e"
+      [
+        {
+          x: tightX,
+          y: tightY,
+          w: tightW,
+          h: tightH,
+          color: "#ef4444",
+          label: "tight logo",
+          dashed: true,
+        },
+        {
+          x: region.x1,
+          y: region.y1,
+          w: region.width,
+          h: region.height,
+          color: "#22c55e",
+          label: `${Math.round(region.width)}×${Math.round(region.height)}px`,
+        },
+      ],
+      matchedFraction
     )
   );
 

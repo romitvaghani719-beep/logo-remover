@@ -167,7 +167,11 @@ export default function LogoRemoverApp() {
               Select or paint the watermark · AI inpaint with LaMa
             </p>
           </div>
-          <div className="flex items-center gap-2 text-xs">
+          <div className="flex items-center gap-4 text-xs">
+            <a href="/debug" className="text-accent hover:underline">
+              Detection flow
+            </a>
+            <div className="flex items-center gap-2">
             <span
               className={`h-2 w-2 rounded-full ${
                 apiOk === null
@@ -184,6 +188,7 @@ export default function LogoRemoverApp() {
                   ? "API ready"
                   : "API offline"}
             </span>
+            </div>
           </div>
         </div>
       </header>

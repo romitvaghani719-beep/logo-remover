@@ -1,11 +1,29 @@
 import type { MaskRegion } from "@/types";
 import { getGeminiSearchRoi, SEARCH_ZONE_FALLBACK_CHAIN } from "@/lib/geminiSearchZone";
+import {
+  DetectionDebugCollector,
+  type DetectionDebugMeta,
+  type DetectionDebugStep,
+  defaultZoneDescription,
+  drawMatchOnImage,
+  drawRegionOnNaturalImage,
+  drawZonesOnImage,
+  floatFieldToStep,
+  imageDataToStep,
+  templateMaskToStep,
+} from "@/lib/geminiDetectDebug";
 
 export interface GeminiDetectionResult {
   region: MaskRegion;
   confidence: number;
   scale: number;
   templateSize: number;
+}
+
+export interface GeminiDetectionDebugResult {
+  result: GeminiDetectionResult | null;
+  steps: DetectionDebugStep[];
+  meta: DetectionDebugMeta;
 }
 
 const TEMPLATE_URLS = [
@@ -812,8 +830,17 @@ async function getTemplates() {
   return templatesCache;
 }
 
+async function pushDebug(
+  debug: DetectionDebugCollector | undefined,
+  step: Promise<DetectionDebugStep>
+): Promise<void> {
+  if (!debug) return;
+  debug.add(await step);
+}
+
 export async function detectGeminiLogo(
-  imageSource: Blob | File
+  imageSource: Blob | File,
+  debug?: DetectionDebugCollector
 ): Promise<GeminiDetectionResult | null> {
   const [bitmap, templates] = await Promise.all([
     createImageBitmap(imageSource),
@@ -827,12 +854,82 @@ export async function detectGeminiLogo(
   const searchW = Math.max(1, Math.round(naturalW * searchScale));
   const searchH = Math.max(1, Math.round(naturalH * searchScale));
 
+  const naturalData = bitmapToImageData(bitmap, naturalW, naturalH);
+  await pushDebug(
+    debug,
+    imageDataToStep(
+      "01-original",
+      "1. Original image",
+      `Full resolution input (${naturalW}×${naturalH}px).`,
+      naturalData
+    )
+  );
+
   const searchData = bitmapToImageData(bitmap, searchW, searchH);
+  await pushDebug(
+    debug,
+    imageDataToStep(
+      "02-search-scale",
+      "2. Search-scale image",
+      searchScale < 0.99
+        ? `Downscaled to ${searchW}×${searchH}px (scale ${searchScale.toFixed(3)}) for faster template matching.`
+        : `Used at full resolution (${searchW}×${searchH}px).`,
+      searchData
+    )
+  );
+
   const gray = toGrayscale(searchData);
   const contrast = toLocalContrast(gray, searchW, searchH);
   const edges = sobelMagnitudes(grayToUnit(gray), searchW, searchH);
   const tplLimit = maxTemplateSize(searchW, searchH);
   const imgMinEdge = Math.min(searchW, searchH);
+
+  await pushDebug(
+    debug,
+    floatFieldToStep(
+      "03-grayscale",
+      "3. Grayscale",
+      "Luminance map used for brightness matching.",
+      gray,
+      searchW,
+      searchH,
+      "gray"
+    )
+  );
+  await pushDebug(
+    debug,
+    floatFieldToStep(
+      "04-local-contrast",
+      "4. Local contrast",
+      "Highlights sparkle-like shapes independent of background color.",
+      contrast,
+      searchW,
+      searchH,
+      "heatmap"
+    )
+  );
+  await pushDebug(
+    debug,
+    floatFieldToStep(
+      "05-sobel-edges",
+      "5. Sobel edges",
+      "Edge map used for coarse corner scan (Pass 2).",
+      edges,
+      searchW,
+      searchH,
+      "heatmap"
+    )
+  );
+  await pushDebug(
+    debug,
+    drawZonesOnImage(
+      "06-search-zones",
+      "6. Search zones",
+      defaultZoneDescription(),
+      searchData,
+      [...SEARCH_ZONE_FALLBACK_CHAIN]
+    )
+  );
 
   let globalBest: {
     score: number;
@@ -843,8 +940,10 @@ export async function detectGeminiLogo(
   } | null = null;
   let globalSecondRaw = -1;
   let matchedFraction: number = SEARCH_ZONE_FALLBACK_CHAIN[0];
+  let triedFractions: number[] = [];
 
   for (const fraction of SEARCH_ZONE_FALLBACK_CHAIN) {
+    triedFractions.push(fraction);
     const result = runCascadedSearch(
       gray,
       contrast,
@@ -866,9 +965,78 @@ export async function detectGeminiLogo(
   }
 
   if (!globalBest || !isAcceptableScore(globalBest.score, globalSecondRaw)) {
+    if (debug) {
+      debug.meta = {
+        naturalWidth: naturalW,
+        naturalHeight: naturalH,
+        searchWidth: searchW,
+        searchHeight: searchH,
+        searchScale,
+        matchedZoneFraction: null,
+        found: false,
+        confidence: globalBest?.score ?? null,
+        templateSize: null,
+        region: null,
+      };
+      await pushDebug(
+        debug,
+        drawZonesOnImage(
+          "07-no-match",
+          "7. No confident match",
+          globalBest
+            ? `Best score ${(globalBest.score * 100).toFixed(0)}% was below threshold (${(MIN_SCORE * 100).toFixed(0)}%) or too close to runner-up.`
+            : "No template produced a valid match inside the search zones.",
+          searchData,
+          triedFractions,
+          triedFractions[triedFractions.length - 1]
+        )
+      );
+    }
     bitmap.close();
     return null;
   }
+
+  const bestTpl = globalBest.tpl;
+  await pushDebug(
+    debug,
+    templateMaskToStep(
+      "07-template",
+      "7. Matched template",
+      `Base ${bestTpl.baseSize}px template at scale ${bestTpl.scale.toFixed(2)} (${bestTpl.width}×${bestTpl.height}px).`,
+      bestTpl.shape.mask,
+      bestTpl.width,
+      bestTpl.height
+    )
+  );
+  await pushDebug(
+    debug,
+    drawMatchOnImage(
+      "08-coarse-match",
+      "8. Coarse + fine match (search scale)",
+      `Score ${(globalBest.score * 100).toFixed(0)}% in ${Math.round(matchedFraction * 100)}% corner zone. Red = template bounds; dashed = tight logo shape.`,
+      searchData,
+      [
+        {
+          x: globalBest.x,
+          y: globalBest.y,
+          w: bestTpl.width,
+          h: bestTpl.height,
+          color: "#3b82f6",
+          label: `match ${(globalBest.score * 100).toFixed(0)}%`,
+        },
+        {
+          x: globalBest.x + bestTpl.tightX,
+          y: globalBest.y + bestTpl.tightY,
+          w: bestTpl.tightW,
+          h: bestTpl.tightH,
+          color: "#ef4444",
+          label: "logo",
+          dashed: true,
+        },
+      ],
+      matchedFraction
+    )
+  );
 
   let finalX = Math.round(globalBest.x / searchScale);
   let finalY = Math.round(globalBest.y / searchScale);
@@ -917,6 +1085,35 @@ export async function detectGeminiLogo(
           { x: finalX, y: finalY, tpl: fullTpl, pass2Score: finalScore },
           roi
         );
+        await pushDebug(
+          debug,
+          drawMatchOnImage(
+            "09-full-res-refine",
+            "9. Full-resolution refine",
+            `Re-scored within ±${FULL_RES_REFINE_PX}px on original pixels. Score ${(refined.score * 100).toFixed(0)}%.`,
+            fullData,
+            [
+              {
+                x: roi.x1,
+                y: roi.y1,
+                w: roi.x2 - roi.x1 + 1,
+                h: roi.y2 - roi.y1 + 1,
+                color: "#a855f7",
+                label: "refine window",
+                dashed: true,
+              },
+              {
+                x: refined.x,
+                y: refined.y,
+                w: fullTpl.width,
+                h: fullTpl.height,
+                color: "#22c55e",
+                label: `refined ${(refined.score * 100).toFixed(0)}%`,
+              },
+            ],
+            matchedFraction
+          )
+        );
         if (refined.score >= finalScore * 0.82) {
           finalX = refined.x;
           finalY = refined.y;
@@ -929,13 +1126,64 @@ export async function detectGeminiLogo(
     fullGray = gray;
   }
 
+  const region = regionFromDetection(finalX, finalY, finalTpl, naturalW, naturalH, fullGray);
+  await pushDebug(
+    debug,
+    drawRegionOnNaturalImage(
+      "10-final-mask",
+      "10. Final mask region",
+      `Padded selection sent to inpaint (${Math.round(region.width)}×${Math.round(region.height)}px, confidence ${(finalScore * 100).toFixed(0)}%).`,
+      naturalData,
+      region,
+      "#22c55e"
+    )
+  );
+
+  if (debug) {
+    debug.meta = {
+      naturalWidth: naturalW,
+      naturalHeight: naturalH,
+      searchWidth: searchW,
+      searchHeight: searchH,
+      searchScale,
+      matchedZoneFraction: matchedFraction,
+      found: true,
+      confidence: finalScore,
+      templateSize: finalTpl.baseSize,
+      region,
+    };
+  }
+
   bitmap.close();
 
   return {
-    region: regionFromDetection(finalX, finalY, finalTpl, naturalW, naturalH, fullGray),
+    region,
     confidence: finalScore,
     scale: finalTpl.scale,
     templateSize: finalTpl.baseSize,
+  };
+}
+
+export async function detectGeminiLogoWithDebug(
+  imageSource: Blob | File
+): Promise<GeminiDetectionDebugResult> {
+  const debug = new DetectionDebugCollector();
+  const result = await detectGeminiLogo(imageSource, debug);
+  return {
+    result,
+    steps: debug.steps,
+    meta: {
+      naturalWidth: debug.meta.naturalWidth ?? 0,
+      naturalHeight: debug.meta.naturalHeight ?? 0,
+      searchWidth: debug.meta.searchWidth ?? 0,
+      searchHeight: debug.meta.searchHeight ?? 0,
+      searchScale: debug.meta.searchScale ?? 1,
+      matchedZoneFraction: debug.meta.matchedZoneFraction ?? null,
+      found: debug.meta.found ?? Boolean(result),
+      confidence: debug.meta.confidence ?? result?.confidence ?? null,
+      templateSize: debug.meta.templateSize ?? result?.templateSize ?? null,
+      region: debug.meta.region ?? result?.region ?? null,
+    },
   };
 }
 

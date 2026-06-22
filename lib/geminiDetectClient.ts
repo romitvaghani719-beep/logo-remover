@@ -1,5 +1,5 @@
 import { detectGeminiLogo as detectGeminiLogoSync } from "@/lib/geminiDetect";
-import type { GeminiDetectionResult } from "@/lib/geminiDetect";
+import type { GeminiDetectionDebugResult, GeminiDetectionResult } from "@/lib/geminiDetect";
 import type { GeminiWorkerResponse } from "@/lib/geminiDetect.worker";
 
 let worker: Worker | null = null;
@@ -72,6 +72,13 @@ export async function detectGeminiLogo(
   } catch {
     return detectGeminiLogoSync(file);
   }
+}
+
+export async function detectGeminiLogoWithDebug(
+  file: File
+): Promise<GeminiDetectionDebugResult> {
+  const { detectGeminiLogoWithDebug: detectDebugSync } = await import("@/lib/geminiDetect");
+  return detectDebugSync(file);
 }
 
 export { clearGeminiTemplateCache } from "@/lib/geminiDetect";

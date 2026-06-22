@@ -19,7 +19,11 @@ import {
   syncBrushOverlayFromMask,
   type RenderedImageBounds,
 } from "@/lib/maskGeometry";
-import { CORNER_SEARCH_FRACTION, getGeminiSearchZone } from "@/lib/geminiSearchZone";
+import {
+  CORNER_SEARCH_FRACTION,
+  CORNER_SEARCH_FALLBACK_FRACTION,
+  getGeminiSearchZone,
+} from "@/lib/geminiSearchZone";
 
 interface MaskCanvasProps {
   imageUrl: string;
@@ -107,39 +111,75 @@ export function MaskCanvas({
     octx.clearRect(0, 0, w, h);
 
     if (showSearchGuides && img.naturalWidth && img.naturalHeight) {
-      const zone = getGeminiSearchZone(img.naturalWidth, img.naturalHeight);
       const scaleX = w / img.naturalWidth;
       const scaleY = h / img.naturalHeight;
-      const cornerX = img.naturalWidth * (1 - CORNER_SEARCH_FRACTION) * scaleX;
-      const cornerY = img.naturalHeight * (1 - CORNER_SEARCH_FRACTION) * scaleY;
-      const search = zone.searchRegion;
+      const primaryZone = getGeminiSearchZone(
+        img.naturalWidth,
+        img.naturalHeight,
+        0,
+        0,
+        CORNER_SEARCH_FRACTION
+      );
+      const fallbackZone = getGeminiSearchZone(
+        img.naturalWidth,
+        img.naturalHeight,
+        0,
+        0,
+        CORNER_SEARCH_FALLBACK_FRACTION
+      );
+      const primary = primaryZone.searchRegion;
+      const fallback = fallbackZone.searchRegion;
 
-      octx.fillStyle = "rgba(99, 102, 241, 0.1)";
+      octx.fillStyle = "rgba(99, 102, 241, 0.06)";
       octx.fillRect(
-        search.x1 * scaleX,
-        search.y1 * scaleY,
-        search.width * scaleX,
-        search.height * scaleY
+        fallback.x1 * scaleX,
+        fallback.y1 * scaleY,
+        fallback.width * scaleX,
+        fallback.height * scaleY
       );
 
-      octx.setLineDash([8, 5]);
-      octx.lineWidth = 1;
-      octx.strokeStyle = "rgba(99, 102, 241, 0.65)";
-      octx.beginPath();
-      octx.moveTo(cornerX, 0);
-      octx.lineTo(cornerX, h);
-      octx.moveTo(0, cornerY);
-      octx.lineTo(w, cornerY);
-      octx.stroke();
+      octx.fillStyle = "rgba(99, 102, 241, 0.12)";
+      octx.fillRect(
+        primary.x1 * scaleX,
+        primary.y1 * scaleY,
+        primary.width * scaleX,
+        primary.height * scaleY
+      );
+
+      const drawFractionLines = (fraction: number, alpha: number) => {
+        const lineX = img.naturalWidth * (1 - fraction) * scaleX;
+        const lineY = img.naturalHeight * (1 - fraction) * scaleY;
+        octx.setLineDash([8, 5]);
+        octx.lineWidth = 1;
+        octx.strokeStyle = `rgba(99, 102, 241, ${alpha})`;
+        octx.beginPath();
+        octx.moveTo(lineX, 0);
+        octx.lineTo(lineX, h);
+        octx.moveTo(0, lineY);
+        octx.lineTo(w, lineY);
+        octx.stroke();
+      };
+
+      drawFractionLines(CORNER_SEARCH_FALLBACK_FRACTION, 0.45);
+      drawFractionLines(CORNER_SEARCH_FRACTION, 0.75);
 
       octx.setLineDash([]);
-      octx.strokeStyle = "rgba(99, 102, 241, 0.85)";
+      octx.strokeStyle = "rgba(99, 102, 241, 0.55)";
+      octx.lineWidth = 1.5;
+      octx.strokeRect(
+        fallback.x1 * scaleX,
+        fallback.y1 * scaleY,
+        fallback.width * scaleX,
+        fallback.height * scaleY
+      );
+
+      octx.strokeStyle = "rgba(99, 102, 241, 0.9)";
       octx.lineWidth = 2;
       octx.strokeRect(
-        search.x1 * scaleX,
-        search.y1 * scaleY,
-        search.width * scaleX,
-        search.height * scaleY
+        primary.x1 * scaleX,
+        primary.y1 * scaleY,
+        primary.width * scaleX,
+        primary.height * scaleY
       );
     }
 
@@ -490,7 +530,7 @@ export function MaskCanvas({
             : "Paint over the logo with your cursor."}
           {showSearchGuides && (
             <span className="mt-1 block text-[11px] text-indigo-300/80">
-              Blue lines = 12% corner boundary · Blue box = auto-detect zone
+              Blue inner = 12% primary · Blue outer = 18% fallback if not found
             </span>
           )}
         </p>

@@ -1,5 +1,5 @@
 import type { MaskRegion } from "@/types";
-import { getGeminiSearchRoi } from "@/lib/geminiSearchZone";
+import { getGeminiSearchRoi, SEARCH_ZONE_FALLBACK_CHAIN } from "@/lib/geminiSearchZone";
 
 export interface GeminiDetectionResult {
   region: MaskRegion;
@@ -475,6 +475,36 @@ function refineWithFullScore(
   return { score: bestScore, x: bestX, y: bestY };
 }
 
+function candidateKey(c: MatchCandidate): string {
+  return `${c.tpl.baseSize}-${c.tpl.scale}-${c.x}-${c.y}`;
+}
+
+function selectPass3Candidates(
+  pool: MatchCandidate[],
+  cornerGuaranteed: MatchCandidate[]
+): MatchCandidate[] {
+  const seen = new Set<string>();
+  const pass3: MatchCandidate[] = [];
+
+  const bestCorners = [...cornerGuaranteed].sort((a, b) => b.pass2Score - a.pass2Score);
+  for (const corner of bestCorners.slice(0, 3)) {
+    const key = candidateKey(corner);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pass3.push(corner);
+  }
+
+  for (const candidate of pool) {
+    const key = candidateKey(candidate);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pass3.push(candidate);
+    if (pass3.length >= PASS3_TOP_N + 3) break;
+  }
+
+  return pass3;
+}
+
 function collectPass2Candidates(
   contrast: Float32Array,
   edges: Float32Array,
@@ -482,8 +512,9 @@ function collectPass2Candidates(
   imgH: number,
   templates: PreparedTemplate[],
   tplLimit: number,
-  imgMinEdge: number
-): MatchCandidate[] {
+  imgMinEdge: number,
+  searchFraction: number
+): { pool: MatchCandidate[]; cornerGuaranteed: MatchCandidate[] } {
   const pass2Pool: MatchCandidate[] = [];
   const cornerGuaranteed: MatchCandidate[] = [];
 
@@ -492,7 +523,7 @@ function collectPass2Candidates(
     if (tpl.tightW > tplLimit || tpl.tightH > tplLimit) continue;
     if (shouldSkipTemplateSize(tpl, imgMinEdge)) continue;
 
-    const searchRoi = getGeminiSearchRoi(imgW, imgH, tpl.width, tpl.height);
+    const searchRoi = getGeminiSearchRoi(imgW, imgH, tpl.width, tpl.height, searchFraction);
     if (searchRoi.x2 < searchRoi.x1 || searchRoi.y2 < searchRoi.y1) continue;
 
     let bestCornerEdge = -1;
@@ -544,7 +575,10 @@ function collectPass2Candidates(
     insertTopCandidate(pass2Pool, corner, PASS2_TOP_N);
   }
 
-  return pass2Pool.slice(0, PASS2_TOP_N);
+  return {
+    pool: pass2Pool.slice(0, PASS2_TOP_N),
+    cornerGuaranteed,
+  };
 }
 
 function runCascadedSearch(
@@ -555,21 +589,23 @@ function runCascadedSearch(
   imgH: number,
   templates: PreparedTemplate[],
   tplLimit: number,
-  imgMinEdge: number
+  imgMinEdge: number,
+  searchFraction: number
 ): {
   best: { score: number; adjusted: number; x: number; y: number; tpl: PreparedTemplate };
   secondRaw: number;
 } {
-  const pass2 = collectPass2Candidates(
+  const { pool: pass2, cornerGuaranteed } = collectPass2Candidates(
     contrast,
     edges,
     imgW,
     imgH,
     templates,
     tplLimit,
-    imgMinEdge
+    imgMinEdge,
+    searchFraction
   );
-  const pass3 = pass2.slice(0, PASS3_TOP_N);
+  const pass3 = selectPass3Candidates(pass2, cornerGuaranteed);
 
   let globalBest = {
     score: -1,
@@ -581,7 +617,13 @@ function runCascadedSearch(
   let globalSecondRaw = -1;
 
   for (const candidate of pass3) {
-    const searchRoi = getGeminiSearchRoi(imgW, imgH, candidate.tpl.width, candidate.tpl.height);
+    const searchRoi = getGeminiSearchRoi(
+      imgW,
+      imgH,
+      candidate.tpl.width,
+      candidate.tpl.height,
+      searchFraction
+    );
     const fineRoi = {
       x1: Math.max(searchRoi.x1, candidate.x - FINE_RADIUS),
       y1: Math.max(searchRoi.y1, candidate.y - FINE_RADIUS),
@@ -792,18 +834,38 @@ export async function detectGeminiLogo(
   const tplLimit = maxTemplateSize(searchW, searchH);
   const imgMinEdge = Math.min(searchW, searchH);
 
-  const { best: globalBest, secondRaw: globalSecondRaw } = runCascadedSearch(
-    gray,
-    contrast,
-    edges,
-    searchW,
-    searchH,
-    templates,
-    tplLimit,
-    imgMinEdge
-  );
+  let globalBest: {
+    score: number;
+    adjusted: number;
+    x: number;
+    y: number;
+    tpl: PreparedTemplate;
+  } | null = null;
+  let globalSecondRaw = -1;
+  let matchedFraction: number = SEARCH_ZONE_FALLBACK_CHAIN[0];
 
-  if (!isAcceptableScore(globalBest.score, globalSecondRaw)) {
+  for (const fraction of SEARCH_ZONE_FALLBACK_CHAIN) {
+    const result = runCascadedSearch(
+      gray,
+      contrast,
+      edges,
+      searchW,
+      searchH,
+      templates,
+      tplLimit,
+      imgMinEdge,
+      fraction
+    );
+
+    if (isAcceptableScore(result.best.score, result.secondRaw)) {
+      globalBest = result.best;
+      globalSecondRaw = result.secondRaw;
+      matchedFraction = fraction;
+      break;
+    }
+  }
+
+  if (!globalBest || !isAcceptableScore(globalBest.score, globalSecondRaw)) {
     bitmap.close();
     return null;
   }
@@ -831,7 +893,13 @@ export async function detectGeminiLogo(
     baseBitmap.close();
 
     if (fullTpl.shape.count > 0 && fullTpl.width < naturalW && fullTpl.height < naturalH) {
-      const zoneRoi = getGeminiSearchRoi(naturalW, naturalH, fullTpl.width, fullTpl.height);
+      const zoneRoi = getGeminiSearchRoi(
+        naturalW,
+        naturalH,
+        fullTpl.width,
+        fullTpl.height,
+        matchedFraction
+      );
       const roi = {
         x1: Math.max(zoneRoi.x1, finalX - FULL_RES_REFINE_PX),
         y1: Math.max(zoneRoi.y1, finalY - FULL_RES_REFINE_PX),

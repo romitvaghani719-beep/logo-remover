@@ -97,13 +97,19 @@ export async function floatFieldToStep(
 ): Promise<DetectionDebugStep> {
   let min = Infinity;
   let max = -Infinity;
+  const finite: number[] = [];
   for (let i = 0; i < field.length; i++) {
     const v = field[i];
     if (!Number.isFinite(v)) continue;
+    finite.push(v);
     if (v < min) min = v;
     if (v > max) max = v;
   }
-  const span = max - min || 1;
+  finite.sort((a, b) => a - b);
+  const pLow = finite[Math.floor(finite.length * 0.02)] ?? min;
+  const pHigh = finite[Math.floor(finite.length * 0.98)] ?? max;
+  const span = mode === "heatmap" ? pHigh - pLow || 1 : max - min || 1;
+  const base = mode === "heatmap" ? pLow : min;
 
   const out = new ImageData(width, height);
   for (let i = 0; i < field.length; i++) {
@@ -118,12 +124,12 @@ export async function floatFieldToStep(
     }
 
     if (mode === "gray") {
-      const g = Math.round(((v - min) / span) * 255);
+      const g = Math.round(((v - base) / span) * 255);
       out.data[o] = g;
       out.data[o + 1] = g;
       out.data[o + 2] = g;
     } else {
-      const t = (v - min) / span;
+      const t = (Math.min(pHigh, Math.max(pLow, v)) - base) / span;
       out.data[o] = Math.round(Math.min(255, t * 320));
       out.data[o + 1] = Math.round(Math.min(255, t * 180));
       out.data[o + 2] = Math.round(255 - t * 200);
@@ -269,12 +275,22 @@ export function defaultZoneDescription(): string {
 }
 
 export async function downloadDebugSteps(steps: DetectionDebugStep[]): Promise<void> {
+  const { default: JSZip } = await import("jszip");
+  const zip = new JSZip();
+
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    const link = document.createElement("a");
-    link.href = step.imageDataUrl;
-    link.download = `${String(i + 1).padStart(2, "0")}-${step.id}.png`;
-    link.click();
-    await new Promise((r) => setTimeout(r, 120));
+    const comma = step.imageDataUrl.indexOf(",");
+    if (comma < 0) continue;
+    const base64 = step.imageDataUrl.slice(comma + 1);
+    zip.file(`step${i + 1}.png`, base64, { base64: true });
   }
+
+  const blob = await zip.generateAsync({ type: "blob" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "gemini-detection-steps.zip";
+  link.click();
+  URL.revokeObjectURL(url);
 }

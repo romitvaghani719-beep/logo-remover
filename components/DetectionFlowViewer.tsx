@@ -25,7 +25,7 @@ export function DetectionFlowViewer({ steps, meta }: DetectionFlowViewerProps) {
           onClick={() => void downloadDebugSteps(steps)}
           className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm text-gray-200 hover:bg-white/10"
         >
-          Download all steps
+          Download all steps (ZIP)
         </button>
       </div>
 
@@ -84,7 +84,7 @@ export function DetectionFlowViewer({ steps, meta }: DetectionFlowViewerProps) {
             <div className="border-t border-white/5 px-4 py-2">
               <a
                 href={step.imageDataUrl}
-                download={`${String(index + 1).padStart(2, "0")}-${step.id}.png`}
+                download={`step${index + 1}.png`}
                 className="text-xs text-accent hover:underline"
               >
                 Download this step

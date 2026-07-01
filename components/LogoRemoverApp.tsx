@@ -3,7 +3,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { MaskCanvas, ToolControls } from "@/components/ImageEditor";
 import { detectGeminiLogo } from "@/lib/geminiDetectClient";
-import { removeLogo as runInpaint } from "@/lib/inpaintClient";
+import type { GeminiDetectionResult } from "@/lib/geminiDetect";
+import {
+  ALPHA_CONFIDENCE_THRESHOLD,
+  RESIDUAL_DETECTION_THRESHOLD,
+  runHybridRemoval,
+  getPlannedRemovalMode,
+  type RemovalPassLog,
+} from "@/lib/hybridRemoval";
+import {
+  getWatermarkFallbackProfiles,
+  type WatermarkProfile,
+} from "@/lib/watermarkProfiles";
 import {
   DEFAULT_EDITOR_SETTINGS,
   type EditorSettings,
@@ -23,9 +34,16 @@ export default function LogoRemoverApp() {
   const [loading, setLoading] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [detectConfidence, setDetectConfidence] = useState<number | null>(null);
+  const [detectionResult, setDetectionResult] = useState<GeminiDetectionResult | null>(null);
   const [detectedRegion, setDetectedRegion] = useState<MaskRegion | null>(null);
+  const [fallbackProfiles, setFallbackProfiles] = useState<WatermarkProfile[]>([]);
+  const [selectedFallback, setSelectedFallback] = useState<WatermarkProfile | null>(null);
+  const [passLog, setPassLog] = useState<RemovalPassLog[]>([]);
+  const [residualClean, setResidualClean] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
+
+  const plannedMode = getPlannedRemovalMode(detectConfidence);
 
   useEffect(() => {
     fetch("/api/health")
@@ -51,7 +69,12 @@ export default function LogoRemoverApp() {
     setMaskBlob(null);
     setRegion(null);
     setDetectedRegion(null);
+    setDetectionResult(null);
     setDetectConfidence(null);
+    setSelectedFallback(null);
+    setPassLog([]);
+    setResidualClean(null);
+    setFallbackProfiles([]);
     setResultUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return null;
@@ -69,18 +92,37 @@ export default function LogoRemoverApp() {
     setDetecting(true);
     setError(null);
     setDetectedRegion(null);
+    setDetectionResult(null);
     setDetectConfidence(null);
+    setSelectedFallback(null);
 
     try {
+      const bitmap = await createImageBitmap(file);
+      const profiles = getWatermarkFallbackProfiles(bitmap.width, bitmap.height);
+      bitmap.close();
+      setFallbackProfiles(profiles);
+
       const result = await detectGeminiLogo(file);
       if (!result) {
-        setError("Gemini logo not detected. Try manual selection or brush.");
+        setError(
+          "Gemini logo not detected. Click Remove logo to brush both V1 + V2 fallback zones, then alpha if needed."
+        );
         return;
       }
 
       setDetectedRegion(result.region);
+      setDetectionResult(result);
       setDetectConfidence(result.confidence);
-      setSettings((s) => ({ ...s, tool: "marquee" }));
+
+      if (result.confidence >= ALPHA_CONFIDENCE_THRESHOLD) {
+        setSettings((s) => ({ ...s, tool: "marquee" }));
+      } else if (result.confidence >= RESIDUAL_DETECTION_THRESHOLD) {
+        setError(
+          `Detected at ${(result.confidence * 100).toFixed(0)}% — will use LaMa inpaint. Pick a fallback or adjust mask if needed.`
+        );
+      } else {
+        setError("Low confidence — use fallback positions or manual selection.");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Auto-detection failed");
     } finally {
@@ -102,25 +144,57 @@ export default function LogoRemoverApp() {
   const handleMaskChange = useCallback((blob: Blob | null, nextRegion: MaskRegion | null) => {
     setMaskBlob(blob);
     setRegion(nextRegion);
+    if (blob) setSelectedFallback(null);
   }, []);
 
+  const selectFallback = (profile: WatermarkProfile) => {
+    setSelectedFallback(profile);
+    setDetectedRegion(profile.region);
+    setDetectionResult(null);
+    setDetectConfidence(null);
+    setError(null);
+    setSettings((s) => ({ ...s, tool: "marquee" }));
+  };
+
+  const canRemove = Boolean(imageFile);
+
   const removeLogo = async () => {
-    if (!imageFile || !maskBlob) {
-      setError("Select or paint over the logo area first.");
+    if (!imageFile) {
+      setError("Upload an image first.");
       return;
     }
 
     setLoading(true);
     setError(null);
+    setPassLog([]);
+    setResidualClean(null);
 
     try {
-      const blob = await runInpaint(imageFile, maskBlob, settings.featherPx);
-      const url = URL.createObjectURL(blob);
+      const result = await runHybridRemoval({
+        imageFile,
+        featherPx: settings.featherPx,
+        maskBlob,
+        manualRegion: region,
+        initialDetection: selectedFallback ? null : detectionResult,
+        selectedFallback,
+        fallbackProfiles,
+        onPass: (log) => setPassLog((prev) => [...prev, log]),
+      });
 
+      const url = URL.createObjectURL(result.blob);
       setResultUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return url;
       });
+      setPassLog(result.passes);
+      setResidualClean(result.clean);
+
+      if (!result.clean && result.finalDetection) {
+        setError(
+          `Logo may still be visible (${(result.finalDetection.confidence * 100).toFixed(0)}% after ${result.passes.length} pass(es)). Edit again or use brush.`
+        );
+      }
+
       setStep("result");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to remove logo");
@@ -135,7 +209,12 @@ export default function LogoRemoverApp() {
     setMaskBlob(null);
     setRegion(null);
     setDetectedRegion(null);
+    setDetectionResult(null);
     setDetectConfidence(null);
+    setSelectedFallback(null);
+    setFallbackProfiles([]);
+    setPassLog([]);
+    setResidualClean(null);
     setError(null);
     setImageUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
@@ -161,10 +240,10 @@ export default function LogoRemoverApp() {
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
           <div>
             <h1 className="text-xl font-bold tracking-tight text-white">
-              Logo Remover
+              Gemini Logo Remover
             </h1>
             <p className="text-sm text-gray-400">
-              Select or paint the watermark · AI inpaint with LaMa
+              Alpha blend when confident · LaMa inpaint + GWT fallbacks · auto re-check
             </p>
           </div>
           <div className="flex items-center gap-4 text-xs">
@@ -172,22 +251,22 @@ export default function LogoRemoverApp() {
               Detection flow
             </a>
             <div className="flex items-center gap-2">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                apiOk === null
-                  ? "bg-yellow-400"
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  apiOk === null
+                    ? "bg-yellow-400"
+                    : apiOk
+                      ? "bg-emerald-400"
+                      : "bg-red-400"
+                }`}
+              />
+              <span className="text-gray-400">
+                {apiOk === null
+                  ? "Checking API..."
                   : apiOk
-                    ? "bg-emerald-400"
-                    : "bg-red-400"
-              }`}
-            />
-            <span className="text-gray-400">
-              {apiOk === null
-                ? "Checking API..."
-                : apiOk
-                  ? "API ready"
-                  : "API offline"}
-            </span>
+                    ? "Inpaint API ready"
+                    : "Inpaint API offline"}
+              </span>
             </div>
           </div>
         </div>
@@ -220,7 +299,7 @@ export default function LogoRemoverApp() {
               Drop an image or click to upload
             </h2>
             <p className="mt-2 text-center text-sm text-gray-400">
-              PNG, JPG, WEBP up to 20MB
+              PNG, JPG, WEBP · ≥70% detection uses reverse alpha blending
             </p>
             <input
               id="file-input"
@@ -240,9 +319,14 @@ export default function LogoRemoverApp() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h2 className="font-semibold text-white">Mark the logo</h2>
+                  <h2 className="font-semibold text-white">Remove watermark</h2>
                   <p className="text-sm text-gray-400">
-                    Auto-detect scans the bottom-right corner zone (highlighted in blue).
+                    {plannedMode === "alpha" &&
+                      "High confidence — reverse alpha blend (no inpaint needed)."}
+                    {plannedMode === "inpaint" &&
+                      "Medium confidence — LaMa inpaint on detected area."}
+                    {plannedMode === "dual-fallback" &&
+                      "No match — Remove logo will brush V1 + V2 zones, then alpha if logo remains."}
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -269,25 +353,45 @@ export default function LogoRemoverApp() {
                 </div>
               )}
 
+              {plannedMode === "dual-fallback" && fallbackProfiles.length > 0 && (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-100">
+                  Both <strong>V1</strong> and <strong>V2</strong> fallback zones will be brushed
+                  and inpainted. If a logo is still detected afterward, alpha blending runs
+                  automatically.
+                </div>
+              )}
+
+              {plannedMode === "alpha" && detectConfidence !== null && (
+                <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-sm text-emerald-200">
+                  {(detectConfidence * 100).toFixed(0)}% confidence — will use{" "}
+                  <strong>reverse alpha blending</strong> (GeminiWatermarkTool method).
+                  Re-check runs automatically after removal.
+                </div>
+              )}
+
               <MaskCanvas
                 imageUrl={imageUrl}
                 settings={settings}
                 onMaskChange={handleMaskChange}
                 detectedRegion={detectedRegion}
+                fallbackProfiles={fallbackProfiles}
+                selectedFallbackId={selectedFallback?.id ?? null}
+                highlightFallbacks={plannedMode !== "alpha"}
+                dualFallbackPreview={plannedMode === "dual-fallback"}
                 disabled={loading || detecting}
               />
 
               {error && (
-                <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
                   {error}
                 </div>
               )}
 
               <button
                 onClick={removeLogo}
-                disabled={loading || !maskBlob}
+                disabled={loading || !canRemove}
                 className={`flex w-full items-center justify-center gap-2 rounded-xl px-6 py-3 font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                  maskBlob ? "bg-accent hover:bg-accent-hover shadow-glow" : "bg-accent/40"
+                  canRemove ? "bg-accent hover:bg-accent-hover shadow-glow" : "bg-accent/40"
                 }`}
               >
                 {loading ? (
@@ -295,6 +399,10 @@ export default function LogoRemoverApp() {
                     <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
                     Removing watermark...
                   </>
+                ) : plannedMode === "alpha" ? (
+                  "Remove with alpha blend"
+                ) : plannedMode === "dual-fallback" ? (
+                  "Remove logo (V1 + V2 brush)"
                 ) : (
                   "Remove logo"
                 )}
@@ -306,39 +414,86 @@ export default function LogoRemoverApp() {
                 settings={settings}
                 onChange={setSettings}
                 disabled={loading}
+                plannedMode={plannedMode}
               />
 
+              {fallbackProfiles.length > 0 && (
+                <div className="glass space-y-2 rounded-xl p-4">
+                  <p className="text-xs font-semibold text-gray-300">
+                    GWT fallback positions
+                  </p>
+                  <p className="text-[11px] leading-relaxed text-gray-500">
+                    Use when auto-detect fails or confidence is low. Applies LaMa inpaint
+                    at the standard Gemini corner slot (logo may or may not be there).
+                  </p>
+                  <div className="space-y-2 pt-1">
+                    {fallbackProfiles.map((profile) => (
+                      <button
+                        key={profile.id}
+                        type="button"
+                        disabled={loading || detecting}
+                        onClick={() => selectFallback(profile)}
+                        className={`w-full rounded-lg border px-3 py-2 text-left text-xs transition ${
+                          selectedFallback?.id === profile.id
+                            ? "border-amber-400/60 bg-amber-500/15 text-amber-100"
+                            : "border-white/10 text-gray-300 hover:bg-white/5"
+                        }`}
+                      >
+                        <span className="font-medium">{profile.label}</span>
+                        <span className="mt-0.5 block font-mono text-[10px] text-gray-500">
+                          margin {profile.marginRight}px ·{" "}
+                          {Math.round(profile.region.width)}×
+                          {Math.round(profile.region.height)}px
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="glass rounded-xl p-4 text-xs leading-relaxed text-gray-400">
-                <p className="mb-2 font-semibold text-gray-300">How it works</p>
+                <p className="mb-2 font-semibold text-gray-300">Pipeline</p>
                 <ol className="list-decimal space-y-1 pl-4">
-                  <li>Upload your image</li>
-                  <li>Gemini logo is auto-detected in the corner zone</li>
-                  <li>Adjust selection or use Brush if needed</li>
-                  <li>Hit Remove logo</li>
+                  <li>Auto-detect in corner zone</li>
+                  <li>≥70% → reverse alpha blend</li>
+                  <li>28–69% → inpaint on detected area</li>
+                  <li>No match → brush V1 + V2, then alpha if logo remains</li>
+                  <li>Re-scan after each pass (up to 4)</li>
                 </ol>
               </div>
 
-              {detectConfidence !== null && region && (
+              {detectConfidence !== null && (
                 <div className="glass rounded-xl p-4 text-xs text-gray-400">
                   <p className="font-semibold text-gray-300">Auto-detect</p>
                   <p className="mt-1">
                     Confidence{" "}
-                    <span className="font-mono text-emerald-400">
+                    <span
+                      className={`font-mono ${
+                        detectConfidence >= ALPHA_CONFIDENCE_THRESHOLD
+                          ? "text-emerald-400"
+                          : detectConfidence >= RESIDUAL_DETECTION_THRESHOLD
+                            ? "text-amber-400"
+                            : "text-red-400"
+                      }`}
+                    >
                       {(detectConfidence * 100).toFixed(0)}%
                     </span>
                   </p>
-                  <p className="mt-1 font-mono">
-                    {Math.round(region.width)}×{Math.round(region.height)}px
+                  <p className="mt-1">
+                    Method:{" "}
+                    <span className="text-white">
+                      {plannedMode === "alpha"
+                        ? "Alpha blend"
+                        : plannedMode === "inpaint"
+                          ? "LaMa inpaint"
+                          : "V1 + V2 dual brush → alpha if needed"}
+                    </span>
                   </p>
-                </div>
-              )}
-
-              {region && detectConfidence === null && (
-                <div className="glass rounded-xl p-4 text-xs text-gray-400">
-                  <p className="font-semibold text-gray-300">Selection</p>
-                  <p className="mt-1 font-mono">
-                    {Math.round(region.width)}×{Math.round(region.height)}px
-                  </p>
+                  {region && (
+                    <p className="mt-1 font-mono">
+                      {Math.round(region.width)}×{Math.round(region.height)}px
+                    </p>
+                  )}
                 </div>
               )}
             </aside>
@@ -350,7 +505,11 @@ export default function LogoRemoverApp() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 className="font-semibold text-white">Result</h2>
-                <p className="text-sm text-gray-400">Compare before and after</p>
+                <p className="text-sm text-gray-400">
+                  {residualClean
+                    ? "Re-check: no logo detected — clean"
+                    : "Re-check: logo may still be present"}
+                </p>
               </div>
               <div className="flex gap-2">
                 <button
@@ -373,6 +532,29 @@ export default function LogoRemoverApp() {
                 </button>
               </div>
             </div>
+
+            {passLog.length > 0 && (
+              <div className="glass rounded-xl p-4 text-xs text-gray-400">
+                <p className="mb-2 font-semibold text-gray-300">
+                  Removal passes ({passLog.length})
+                </p>
+                <ul className="space-y-1">
+                  {passLog.map((p) => (
+                    <li key={p.pass} className="font-mono text-[11px]">
+                      #{p.pass}{" "}
+                      <span
+                        className={
+                          p.method === "alpha" ? "text-emerald-400" : "text-sky-400"
+                        }
+                      >
+                        {p.method}
+                      </span>{" "}
+                      — {p.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             <div className="grid gap-4 md:grid-cols-2">
               <div className="glass overflow-hidden rounded-xl">

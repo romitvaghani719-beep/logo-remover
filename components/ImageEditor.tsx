@@ -24,12 +24,19 @@ import {
   CORNER_SEARCH_FALLBACK_FRACTION,
   getGeminiSearchZone,
 } from "@/lib/geminiSearchZone";
+import type { WatermarkProfile } from "@/lib/watermarkProfiles";
+import type { PlannedRemovalMode } from "@/types";
 
 interface MaskCanvasProps {
   imageUrl: string;
   settings: EditorSettings;
   onMaskChange: (maskBlob: Blob | null, region: MaskRegion | null) => void;
   detectedRegion?: MaskRegion | null;
+  fallbackProfiles?: WatermarkProfile[];
+  selectedFallbackId?: string | null;
+  highlightFallbacks?: boolean;
+  /** Show both fallback zones filled like a brush mask (no-detect mode). */
+  dualFallbackPreview?: boolean;
   showSearchGuides?: boolean;
   disabled?: boolean;
 }
@@ -39,6 +46,10 @@ export function MaskCanvas({
   settings,
   onMaskChange,
   detectedRegion = null,
+  fallbackProfiles = [],
+  selectedFallbackId = null,
+  highlightFallbacks = false,
+  dualFallbackPreview = false,
   showSearchGuides = true,
   disabled = false,
 }: MaskCanvasProps) {
@@ -183,10 +194,24 @@ export function MaskCanvas({
       );
     }
 
+    if (dualFallbackPreview && fallbackProfiles.length > 0 && img.naturalWidth) {
+      const scaleX = w / img.naturalWidth;
+      const scaleY = h / img.naturalHeight;
+      octx.fillStyle = "rgba(239, 68, 68, 0.5)";
+      for (const profile of fallbackProfiles) {
+        octx.fillRect(
+          profile.region.x1 * scaleX,
+          profile.region.y1 * scaleY,
+          profile.region.width * scaleX,
+          profile.region.height * scaleY
+        );
+      }
+    }
+
     if (settings.tool === "brush" && maskHasContent(maskCtx)) {
       syncBrushOverlayFromMask(maskCtx, octx);
     }
-  }, [bounds, settings.tool, showSearchGuides]);
+  }, [bounds, settings.tool, showSearchGuides, dualFallbackPreview, fallbackProfiles]);
 
   const publishMask = useCallback(
     async (nextRegion: MaskRegion | null = region) => {
@@ -245,7 +270,7 @@ export function MaskCanvas({
 
   useEffect(() => {
     redrawOverlay();
-  }, [redrawOverlay, region, marqueeDraft, hasMask]);
+  }, [redrawOverlay, region, marqueeDraft, hasMask, dualFallbackPreview, fallbackProfiles, bounds]);
 
   const clearMask = () => {
     const img = imgRef.current;
@@ -473,6 +498,16 @@ export function MaskCanvas({
   const selectionBoxStyle =
     activeRegion && bounds ? imageToDisplayRect(activeRegion, bounds) : null;
 
+  const showFallbackGuides = highlightFallbacks && fallbackProfiles.length > 0;
+
+  const fallbackBoxStyles = showFallbackGuides
+    ? fallbackProfiles.map((profile) => ({
+        profile,
+        style: bounds ? imageToDisplayRect(profile.region, bounds) : null,
+        selected: profile.id === selectedFallbackId,
+      }))
+    : [];
+
   return (
     <div className="space-y-2">
       <div className="flex justify-center rounded-xl border border-white/10 bg-black/40 p-1">
@@ -493,6 +528,30 @@ export function MaskCanvas({
             ref={overlayCanvasRef}
             className="pointer-events-none absolute left-0 top-0 block"
           />
+
+          {fallbackBoxStyles.map(
+            ({ profile, style, selected }) =>
+              style && (
+                <div
+                  key={profile.id}
+                  className={`pointer-events-none absolute box-border ${
+                    selected
+                      ? "border-2 border-amber-400 bg-amber-500/25"
+                      : "border border-dashed border-amber-400/50 bg-amber-500/10"
+                  }`}
+                  style={{
+                    left: style.left,
+                    top: style.top,
+                    width: style.width,
+                    height: style.height,
+                  }}
+                >
+                  <span className="absolute -top-5 left-0 whitespace-nowrap rounded bg-amber-600/90 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white">
+                    {profile.label}
+                  </span>
+                </div>
+              )
+          )}
 
           {selectionBoxStyle && (
             <div
@@ -551,9 +610,10 @@ interface ToolControlsProps {
   settings: EditorSettings;
   onChange: (settings: EditorSettings) => void;
   disabled?: boolean;
+  plannedMode?: PlannedRemovalMode;
 }
 
-export function ToolControls({ settings, onChange, disabled }: ToolControlsProps) {
+export function ToolControls({ settings, onChange, disabled, plannedMode }: ToolControlsProps) {
   const update = <K extends keyof EditorSettings>(key: K, value: EditorSettings[K]) => {
     onChange({ ...settings, [key]: value });
   };
@@ -626,10 +686,29 @@ export function ToolControls({ settings, onChange, disabled }: ToolControlsProps
       </label>
 
       <div className="rounded-lg border border-white/5 bg-black/20 p-3 text-xs leading-relaxed text-gray-400">
-        <p className="font-medium text-gray-300">Select box</p>
-        <p className="mt-1">Drag a rectangle around the logo, or use Re-detect.</p>
-        <p className="mt-2 font-medium text-gray-300">Brush</p>
-        <p className="mt-1">Paint directly over the watermark for precise control.</p>
+        {plannedMode === "alpha" ? (
+          <>
+            <p className="font-medium text-emerald-300">Alpha blend mode</p>
+            <p className="mt-1">
+              High-confidence detection — removal uses reverse alpha math, not brush.
+            </p>
+          </>
+        ) : plannedMode === "dual-fallback" ? (
+          <>
+            <p className="font-medium text-amber-300">Dual fallback mode</p>
+            <p className="mt-1">
+              V1 + V2 zones are pre-brushed (red). Click Remove logo — no manual selection
+              needed. Alpha runs automatically if logo remains.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="font-medium text-gray-300">Select box</p>
+            <p className="mt-1">Drag a rectangle around the logo, or use Re-detect.</p>
+            <p className="mt-2 font-medium text-gray-300">Brush</p>
+            <p className="mt-1">Paint over the watermark for inpaint cleanup.</p>
+          </>
+        )}
       </div>
     </div>
   );

@@ -1,5 +1,8 @@
 export type SelectionTool = "marquee" | "brush";
 
+/** How the next removal pass will run (derived from detection confidence). */
+export type PlannedRemovalMode = "alpha" | "inpaint" | "dual-fallback";
+
 export interface EditorSettings {
   tool: SelectionTool;
   brushSize: number;

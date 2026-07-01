@@ -1,6 +1,11 @@
 import type { MaskRegion } from "@/types";
 import { getGeminiSearchRoi, SEARCH_ZONE_FALLBACK_CHAIN } from "@/lib/geminiSearchZone";
 import {
+  buildLogoProcessingStack,
+  liftFieldToRgbImage,
+  type LogoProcessingStack,
+} from "@/lib/geminiImageProcessing";
+import {
   DetectionDebugCollector,
   type DetectionDebugMeta,
   type DetectionDebugStep,
@@ -26,13 +31,15 @@ export interface GeminiDetectionDebugResult {
 }
 
 const TEMPLATE_URLS = [
+  "/templates/gemini-40.png",
   "/templates/gemini-48.png",
+  "/templates/gemini-64.png",
   "/templates/gemini-96.png",
 ];
 
-const SCALE_MULTIPLIERS = [0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15];
+const SCALE_MULTIPLIERS = [0.7, 0.85, 1.0, 1.15, 1.3];
 
-const MIN_SCORE = 0.38;
+const MIN_SCORE = 0.28;
 const MIN_RELATIVE_GAP = 1.1;
 const PAD_RATIO = 0.08;
 /** Tiny fixed pad on the final inpaint mask — keeps step 10 aligned with step 9. */
@@ -339,48 +346,95 @@ function channelScore(
 }
 
 function edgeOnlyScore(
-  edges: Float32Array,
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   tpl: PreparedTemplate,
   x: number,
   y: number
 ): number {
-  return channelScore(edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true);
+  const wm = channelScore(
+    stack.watermark,
+    imgW,
+    imgH,
+    tpl.shape,
+    tpl.width,
+    tpl.height,
+    x,
+    y,
+    true
+  );
+  const shape = channelScore(
+    stack.shapeContrast,
+    imgW,
+    imgH,
+    tpl.shape,
+    tpl.width,
+    tpl.height,
+    x,
+    y,
+    true
+  );
+  const lift = channelScore(stack.lift, imgW, imgH, tpl.shape, tpl.width, tpl.height, x, y, true);
+  const edge =
+    channelScore(stack.edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true) * 0.55;
+  return Math.max(wm * 1.1, shape * 1.05, lift * 0.95, edge);
 }
 
 function edgeShapeScore(
-  contrast: Float32Array,
-  edges: Float32Array,
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   tpl: PreparedTemplate,
   x: number,
   y: number
 ): number {
-  const edge = channelScore(edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true);
-  const shape = channelScore(contrast, imgW, imgH, tpl.shape, tpl.width, tpl.height, x, y, true);
-  return Math.max(edge, shape * 0.98);
+  return edgeOnlyScore(stack, imgW, imgH, tpl, x, y);
 }
 
 function combinedScore(
-  gray: Float32Array,
-  contrast: Float32Array,
-  edges: Float32Array,
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   tpl: PreparedTemplate,
   x: number,
   y: number
 ): number {
-  const shape = channelScore(contrast, imgW, imgH, tpl.shape, tpl.width, tpl.height, x, y, true);
-  const edge = channelScore(edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true);
+  const wm = channelScore(
+    stack.watermark,
+    imgW,
+    imgH,
+    tpl.shape,
+    tpl.width,
+    tpl.height,
+    x,
+    y,
+    true
+  );
+  const shape = channelScore(
+    stack.shapeContrast,
+    imgW,
+    imgH,
+    tpl.shape,
+    tpl.width,
+    tpl.height,
+    x,
+    y,
+    true
+  );
+  const lift = channelScore(stack.lift, imgW, imgH, tpl.shape, tpl.width, tpl.height, x, y, true);
+  const edge =
+    channelScore(stack.edges, imgW, imgH, tpl.edge, tpl.width, tpl.height, x, y, true) * 0.6;
   const lum = Math.max(
-    Math.abs(channelScore(gray, imgW, imgH, tpl.gray, tpl.width, tpl.height, x, y, false)),
-    Math.abs(channelScore(contrast, imgW, imgH, tpl.gray, tpl.width, tpl.height, x, y, false))
+    Math.abs(
+      channelScore(stack.gray, imgW, imgH, tpl.gray, tpl.width, tpl.height, x, y, false)
+    ),
+    Math.abs(
+      channelScore(stack.lift, imgW, imgH, tpl.gray, tpl.width, tpl.height, x, y, false)
+    )
   );
 
-  return Math.max(shape, edge * 0.98, lum * 0.92);
+  return Math.max(wm, shape * 0.98, lift * 0.92, edge, lum * 0.85);
 }
 
 function insertTopCandidate(
@@ -439,8 +493,8 @@ function cornerAnchoredPositions(
   return positions;
 }
 
-function searchCoarseEdgeOnly(
-  edges: Float32Array,
+function searchCoarseInStrip(
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   tpl: PreparedTemplate,
@@ -453,7 +507,7 @@ function searchCoarseEdgeOnly(
 
   for (let y = roi.y1; y <= roi.y2; y += stride) {
     for (let x = roi.x1; x <= roi.x2; x += stride) {
-      const score = edgeOnlyScore(edges, imgW, imgH, tpl, x, y);
+      const score = edgeOnlyScore(stack, imgW, imgH, tpl, x, y);
       if (score > bestScore) {
         bestScore = score;
         bestX = x;
@@ -466,23 +520,21 @@ function searchCoarseEdgeOnly(
 }
 
 function refineWithFullScore(
-  gray: Float32Array,
-  contrast: Float32Array,
-  edges: Float32Array,
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   candidate: MatchCandidate,
   roi: { x1: number; y1: number; x2: number; y2: number }
 ): { score: number; x: number; y: number } {
   const tpl = candidate.tpl;
-  let bestScore = combinedScore(gray, contrast, edges, imgW, imgH, tpl, candidate.x, candidate.y);
+  let bestScore = combinedScore(stack, imgW, imgH, tpl, candidate.x, candidate.y);
   let bestX = candidate.x;
   let bestY = candidate.y;
 
   for (let y = roi.y1; y <= roi.y2; y += FINE_STRIDE) {
     for (let x = roi.x1; x <= roi.x2; x += FINE_STRIDE) {
       if (x === candidate.x && y === candidate.y) continue;
-      const score = combinedScore(gray, contrast, edges, imgW, imgH, tpl, x, y);
+      const score = combinedScore(stack, imgW, imgH, tpl, x, y);
       if (score > bestScore) {
         bestScore = score;
         bestX = x;
@@ -525,8 +577,7 @@ function selectPass3Candidates(
 }
 
 function collectPass2Candidates(
-  contrast: Float32Array,
-  edges: Float32Array,
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   templates: PreparedTemplate[],
@@ -545,12 +596,25 @@ function collectPass2Candidates(
     const searchRoi = getGeminiSearchRoi(imgW, imgH, tpl.width, tpl.height, searchFraction);
     if (searchRoi.x2 < searchRoi.x1 || searchRoi.y2 < searchRoi.y1) continue;
 
+    const stripRoi = {
+      x1: Math.max(
+        searchRoi.x1,
+        imgW - tpl.width - Math.max(40, Math.round(Math.max(tpl.width, tpl.height) * 2.5))
+      ),
+      y1: Math.max(
+        searchRoi.y1,
+        imgH - tpl.height - Math.max(40, Math.round(Math.max(tpl.width, tpl.height) * 2.5))
+      ),
+      x2: searchRoi.x2,
+      y2: searchRoi.y2,
+    };
+
     let bestCornerEdge = -1;
     let cornerX = searchRoi.x1;
     let cornerY = searchRoi.y1;
 
     for (const pos of cornerAnchoredPositions(imgW, imgH, tpl.width, tpl.height, searchRoi)) {
-      const edgeScore = edgeOnlyScore(edges, imgW, imgH, tpl, pos.x, pos.y);
+      const edgeScore = edgeOnlyScore(stack, imgW, imgH, tpl, pos.x, pos.y);
       if (edgeScore > bestCornerEdge) {
         bestCornerEdge = edgeScore;
         cornerX = pos.x;
@@ -563,11 +627,18 @@ function collectPass2Candidates(
         x: cornerX,
         y: cornerY,
         tpl,
-        pass2Score: edgeShapeScore(contrast, edges, imgW, imgH, tpl, cornerX, cornerY),
+        pass2Score: edgeShapeScore(stack, imgW, imgH, tpl, cornerX, cornerY),
       });
     }
 
-    const coarseEdge = searchCoarseEdgeOnly(edges, imgW, imgH, tpl, COARSE_STRIDE, searchRoi);
+    const coarseEdge = searchCoarseInStrip(
+      stack,
+      imgW,
+      imgH,
+      tpl,
+      COARSE_STRIDE,
+      stripRoi
+    );
     if (coarseEdge.score >= 0) {
       insertTopCandidate(
         pass2Pool,
@@ -575,15 +646,7 @@ function collectPass2Candidates(
           x: coarseEdge.x,
           y: coarseEdge.y,
           tpl,
-          pass2Score: edgeShapeScore(
-            contrast,
-            edges,
-            imgW,
-            imgH,
-            tpl,
-            coarseEdge.x,
-            coarseEdge.y
-          ),
+          pass2Score: edgeShapeScore(stack, imgW, imgH, tpl, coarseEdge.x, coarseEdge.y),
         },
         PASS2_TOP_N
       );
@@ -601,9 +664,7 @@ function collectPass2Candidates(
 }
 
 function runCascadedSearch(
-  gray: Float32Array,
-  contrast: Float32Array,
-  edges: Float32Array,
+  stack: LogoProcessingStack,
   imgW: number,
   imgH: number,
   templates: PreparedTemplate[],
@@ -615,8 +676,7 @@ function runCascadedSearch(
   secondRaw: number;
 } {
   const { pool: pass2, cornerGuaranteed } = collectPass2Candidates(
-    contrast,
-    edges,
+    stack,
     imgW,
     imgH,
     templates,
@@ -650,15 +710,7 @@ function runCascadedSearch(
       y2: Math.min(searchRoi.y2, candidate.y + FINE_RADIUS),
     };
 
-    const refined = refineWithFullScore(
-      gray,
-      contrast,
-      edges,
-      imgW,
-      imgH,
-      candidate,
-      fineRoi
-    );
+    const refined = refineWithFullScore(stack, imgW, imgH, candidate, fineRoi);
     const adjusted = adjustedCandidateScore(refined.score, candidate.tpl, imgMinEdge);
 
     if (adjusted > globalBest.adjusted) {
@@ -760,7 +812,7 @@ function regionFromBox(
 
 let templatesCache: PreparedTemplate[] | null = null;
 let templatesCacheVersion = 0;
-const TEMPLATE_CACHE_VERSION = 6;
+const TEMPLATE_CACHE_VERSION = 9;
 
 async function getTemplates() {
   if (!templatesCache || templatesCacheVersion !== TEMPLATE_CACHE_VERSION) {
@@ -818,31 +870,26 @@ export async function detectGeminiLogo(
     )
   );
 
-  const gray = toGrayscale(searchData);
-  const contrast = toLocalContrast(gray, searchW, searchH);
-  const edges = sobelMagnitudes(grayToUnit(gray), searchW, searchH);
+  const stack = buildLogoProcessingStack(searchData);
   const tplLimit = maxTemplateSize(searchW, searchH);
   const imgMinEdge = Math.min(searchW, searchH);
 
   await pushDebug(
     debug,
-    floatFieldToStep(
-      "03-grayscale",
-      "3. Grayscale",
-      "Luminance map used for brightness matching.",
-      gray,
-      searchW,
-      searchH,
-      "gray"
+    imageDataToStep(
+      "03-rgb-lift",
+      "3. RGB logo lift",
+      "Per-channel RGB processing: logo lifted bright white above dark background. Gemini star should glow in bottom-right.",
+      liftFieldToRgbImage(stack.lift, searchW, searchH)
     )
   );
   await pushDebug(
     debug,
     floatFieldToStep(
-      "04-local-contrast",
-      "4. Local contrast",
-      "Highlights sparkle-like shapes independent of background color.",
-      contrast,
+      "04-watermark-residual",
+      "4. RGB watermark residual",
+      "White top-hat on R, G, B at multiple scales — faint logos on matching gray/lavender floors.",
+      stack.watermark,
       searchW,
       searchH,
       "heatmap"
@@ -851,10 +898,22 @@ export async function detectGeminiLogo(
   await pushDebug(
     debug,
     floatFieldToStep(
-      "05-sobel-edges",
-      "5. Sobel edges",
-      "Edge map used for coarse corner scan (Pass 2).",
-      edges,
+      "05-logo-shape-contrast",
+      "5. Logo shape contrast",
+      "Wide local contrast on the lift field — star edges pop even when color matches background.",
+      stack.shapeContrast,
+      searchW,
+      searchH,
+      "heatmap"
+    )
+  );
+  await pushDebug(
+    debug,
+    floatFieldToStep(
+      "06-sobel-edges",
+      "6. Sobel edges (secondary)",
+      "Edge map — used with lower weight; fabric edges no longer dominate.",
+      stack.edges,
       searchW,
       searchH,
       "heatmap"
@@ -863,8 +922,8 @@ export async function detectGeminiLogo(
   await pushDebug(
     debug,
     drawZonesOnImage(
-      "06-search-zones",
-      "6. Search zones",
+      "07-search-zones",
+      "7. Search zones",
       defaultZoneDescription(),
       searchData,
       [...SEARCH_ZONE_FALLBACK_CHAIN]
@@ -885,9 +944,7 @@ export async function detectGeminiLogo(
   for (const fraction of SEARCH_ZONE_FALLBACK_CHAIN) {
     triedFractions.push(fraction);
     const result = runCascadedSearch(
-      gray,
-      contrast,
-      edges,
+      stack,
       searchW,
       searchH,
       templates,
@@ -986,12 +1043,9 @@ export async function detectGeminiLogo(
 
   if (searchScale < 0.99) {
     const fullData = bitmapToImageData(bitmap, naturalW, naturalH);
-    const fullGray = toGrayscale(fullData);
-    const fullContrast = toLocalContrast(fullGray, naturalW, naturalH);
-    const fullEdges = sobelMagnitudes(grayToUnit(fullGray), naturalW, naturalH);
+    const fullStack = buildLogoProcessingStack(fullData);
     const fullTplSize = Math.max(16, Math.round(globalBest.tpl.width / searchScale));
-    const baseUrl =
-      globalBest.tpl.baseSize === 48 ? TEMPLATE_URLS[0] : TEMPLATE_URLS[1];
+    const baseUrl = `/templates/gemini-${globalBest.tpl.baseSize}.png`;
     const baseBitmap = await loadImageBitmap(baseUrl);
     const fullTpl = prepareTemplateFromImageData(
       bitmapToImageData(baseBitmap, fullTplSize, fullTplSize),
@@ -1017,9 +1071,7 @@ export async function detectGeminiLogo(
 
       if (roi.x2 >= roi.x1 && roi.y2 >= roi.y1) {
         const refined = refineWithFullScore(
-          fullGray,
-          fullContrast,
-          fullEdges,
+          fullStack,
           naturalW,
           naturalH,
           { x: finalX, y: finalY, tpl: fullTpl, pass2Score: finalScore },
